@@ -1,23 +1,47 @@
-cat > .gitignore << 'EOF'
+# OS / Editors
+.DS_Store
+.vscode/
+.idea/
+
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.egg-info/
 *.log
-.venv/
+.pytest_cache/
+.coverage*
+
+# Virtual environments
 venv/
+.venv/
 env/
+backend/venv/
+
+# Environment files
+.env
+.env.*
 *.env
 
-# Node
+# Node / JS
 node_modules/
+frontend/node_modules/
 .next/
 dist/
 build/
 
-# OS/Editor
-.DS_Store
-.vscode/
-.idea/
-EOF
-git add .gitignore
-git commit -m "chore: add root .gitignore"
+# App artifacts (don’t commit local uploads or scratch data)
+backend/uploads/
+data/
+tmp/
+cache/
+
+# Large binaries (keep out of git)
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.pt
+*.pth
+*.onnx
+*.dylib
