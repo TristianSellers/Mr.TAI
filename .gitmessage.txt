@@ -1,0 +1,18 @@
+# <type>: <short summary>
+# types: feat | fix | docs | chore | test | refactor | perf | build | ci
+# Example: feat: connect frontend to backend health endpoint
+
+# Why
+# - reason 1
+# - reason 2
+
+# What changed
+# - change 1
+# - change 2
+
+# Next steps (optional)
+# - [ ]
+# - [ ]
+
+# Footer (optional: closes issues)
+# Closes #<id>

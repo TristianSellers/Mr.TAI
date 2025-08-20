@@ -1,0 +1,27 @@
+name: "✨ Feature request"
+description: Propose a new capability or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the change at a high level
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] Behavior A
+        - [ ] Behavior B
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks / trade-offs
