@@ -36,6 +36,45 @@ async def upload_file(file: UploadFile = File(...)):
 
     return {"message": f"Uploaded '{file.filename}'", "saved_to": str(out_path)}
 
+from pydantic import BaseModel
+import uuid
+
+# ---- simple in-memory job store (dev only) ----
+from typing import Dict, Literal
+from datetime import datetime
+
+JobStatus = Literal["queued", "processing", "done", "error"]
+JOBS: Dict[str, dict] = {}
+
+
+class ProcessRequest(BaseModel):
+    filename: str
+
+@app.post("/process")
+def process_file(req: ProcessRequest):
+    # In the future: kick off AI pipeline here
+    job_id = str(uuid.uuid4())  # generate fake job id
+    # record a fake job for later lookup
+    JOBS[job_id] = {
+        "job_id": job_id,
+        "filename": req.filename,
+        "status": "queued",
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    return {
+        "message": f"Processing started for {req.filename}",
+        "job_id": job_id,
+        "status": "queued"
+    }
+
+@app.get("/status/{job_id}")
+def get_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return {"error": "job_id not found", "job_id": job_id}
+    return job
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "version": "0.1.0"}
