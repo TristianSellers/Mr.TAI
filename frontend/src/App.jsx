@@ -13,7 +13,7 @@ export default function App() {
         const data = await getHealth();
         // data is something like { message: "Hello from Mr. TAI!" }
         setBackendMsg(data.message ?? JSON.stringify(data));
-      } catch (e) {
+      } catch  {
         setBackendMsg("Failed to reach backend. Is FastAPI running on :8000?");
       }
     })();
@@ -29,7 +29,7 @@ export default function App() {
       setUploading(true);
       const resp = await uploadFile(file);
       setResult(resp);
-    } catch (e) {
+    } catch {
       setError("Upload failed. Check backend logs and CORS.");
     } finally {
       setUploading(false);
