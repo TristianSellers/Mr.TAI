@@ -1,19 +1,20 @@
-const API_URL = "http://127.0.0.1:8000"; // backend address
+const API_BASE =
+  import.meta?.env?.VITE_API_BASE?.replace(/\/+$/, "") || "http://127.0.0.1:8000";
 
-// Test GET request
 export async function getHealth() {
-  const response = await fetch(`${API_URL}/`);
-  return response.json();
+  const res = await fetch(`${API_BASE}/health`);
+  if (!res.ok) throw new Error(`Health check failed: ${res.status}`);
+  return res.json();
 }
 
-// File upload
 export async function uploadFile(file) {
-  const formData = new FormData();
-  formData.append("file", file);
+  const form = new FormData();
+  form.append("file", file);
 
-  const response = await fetch(`${API_URL}/upload`, {
+  const res = await fetch(`${API_BASE}/upload`, {
     method: "POST",
-    body: formData,
+    body: form,
   });
-  return response.json();
+  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+  return res.json();
 }
