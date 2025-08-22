@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Literal
 from datetime import datetime
 from dotenv import load_dotenv
+from middleware_logging import register_request_logging
+from error_handlers import register_error_handlers
 import uuid
 import shutil
 import os
@@ -16,6 +18,9 @@ allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",
 port = int(os.getenv("PORT", 8000))
 
 app = FastAPI(title="Mr. TAI Backend", version="0.1.0")
+
+register_request_logging(app)
+register_error_handlers(app)
 
 app.add_middleware(
     CORSMiddleware,
