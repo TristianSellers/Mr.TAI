@@ -5,9 +5,15 @@ from pydantic import BaseModel
 from pathlib import Path
 from typing import Dict, Literal
 from datetime import datetime
+from dotenv import load_dotenv
 import uuid
 import shutil
 import os
+
+load_dotenv()
+
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+port = int(os.getenv("PORT", 8000))
 
 app = FastAPI(title="Mr. TAI Backend", version="0.1.0")
 
