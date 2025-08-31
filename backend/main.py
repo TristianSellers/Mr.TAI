@@ -1,6 +1,7 @@
 from backend.core.models import Job, JobState  
 from backend.core.registry import jobs         
 from backend.providers.tts_local import synth_to_wav  
+from backend.steps.script import segments_to_commentary
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
@@ -48,10 +49,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
 
 @app.get("/")
 def root():
@@ -363,4 +360,65 @@ def demo_say(text: str = "Hello from Mr. TAI!"):
     return {
         "message": "ok",
         "audio": str(demo_out),
+    }
+
+class CommentaryRequest(BaseModel):
+    filename: str  # stored_name from /upload
+    max_lines: int = 3
+
+@app.post("/demo/commentary")
+async def demo_commentary(req: CommentaryRequest):
+    # 1) locate upload
+    src = UPLOAD_DIR / req.filename
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="Uploaded file not found")
+
+    # 2) ensure WAV
+    media_type = "video" if _is_video(req.filename) else "audio"
+    if media_type == "video":
+        audio_path = _extract_audio_to_wav(str(src), DATA_DIR)
+    else:
+        audio_path = str(src)
+
+    # 3) faster-whisper ASR (you already have this logic)
+    asr_model = get_asr_model()
+    seg_iter, _info = asr_model.transcribe(str(audio_path), task="transcribe", vad_filter=True, beam_size=5)
+    if media_type == "video":
+        audio_path = _extract_audio_to_wav(str(src), DATA_DIR)  # Path
+    else:
+        audio_path = str(src)  # str
+
+    # Add this line:
+    audio_path_str = str(audio_path)
+    # Then use audio_path_str in transcribe:
+    seg_iter, _info = asr_model.transcribe(audio_path_str, task="transcribe", vad_filter=True, beam_size=5)
+
+    segments = []
+    for i, s in enumerate(seg_iter):
+        segments.append({
+            "id": i,
+            "start": float(s.start),
+            "end": float(s.end),
+            "text": (s.text or "").strip()
+        })
+
+    # 4) minimal commentary text
+    text = segments_to_commentary(segments, max_lines=req.max_lines)
+
+    # 5) synth to WAV
+    out_path = DATA_DIR / "demo" / f"commentary_{uuid.uuid4().hex}.wav"
+    synth_to_wav(text, out_path)
+
+    # 6) cleanup (optional): if we created a temp wav from video, remove it
+    try:
+        if media_type == "video" and isinstance(audio_path, str) and audio_path.startswith(str(DATA_DIR)):
+            Path(audio_path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return {
+        "message": "ok",
+        "commentary_text": text,
+        "audio": str(out_path),
+        "segments_used": min(req.max_lines, len(segments)),
     }
