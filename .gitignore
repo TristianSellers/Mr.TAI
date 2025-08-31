@@ -31,7 +31,7 @@ dist/
 build/
 
 # App artifacts (don’t commit local uploads or scratch data)
-backend/uploads/
+uploads/
 data/
 tmp/
 cache/

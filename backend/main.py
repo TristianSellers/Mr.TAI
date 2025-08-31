@@ -1,3 +1,5 @@
+from backend.core.models import Job, JobState  # NEW
+from backend.core.registry import jobs         # NEW
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
@@ -9,8 +11,8 @@ from pathlib import Path
 from typing import Dict, Literal, Optional
 from datetime import datetime
 from dotenv import load_dotenv
-from middleware_logging import register_request_logging
-from error_handlers import register_error_handlers
+from .middleware_logging import register_request_logging
+from .error_handlers import register_error_handlers
 from collections import Counter
 import uuid
 import shutil
@@ -27,11 +29,11 @@ allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",
 port = int(os.getenv("PORT", 8000))
 
 # Introduce DATA_DIR (base) and make UPLOAD_DIR live under it
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+REPO_ROOT = Path(__file__).resolve().parents[1]   # .../Mr.TAI
+DATA_DIR = Path(os.getenv("DATA_DIR", REPO_ROOT / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
+(DATA_DIR).mkdir(parents=True, exist_ok=True)
+(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="Mr. TAI Backend", version="0.1.0")
 
 register_request_logging(app)
@@ -76,42 +78,78 @@ async def upload_file(file: UploadFile = File(...)):
 
     return {"message": f"Uploaded '{safe}'", "saved_to": str(out_path), "stored_name": unique}
 
-JobStatus = Literal["queued", "processing", "done", "error"]
-JOBS: Dict[str, dict] = {}
-
 class ProcessRequest(BaseModel):
     filename: str  # should match "stored_name" returned by /upload
 
 def _simulate_processing(job_id: str):
-    # NOTE: this runs in-process; fine for dev demos
     import time
-    JOBS[job_id]["status"] = "processing"
-    time.sleep(2)  # pretend work
-    JOBS[job_id]["status"] = "done"
-    JOBS[job_id]["completed_at"] = datetime.utcnow().isoformat() + "Z"
+    job = jobs[job_id]  # look up the Job instance
+    try:
+        job.state = JobState.processing
+        time.sleep(2)  # pretend work
+        job.state = JobState.done
+    except Exception as ex:
+        job.state = JobState.error
+        job.error = str(ex)
 
 @app.post("/process")
 def process_file(req: ProcessRequest, background: BackgroundTasks):
-    # optional: verify file exists
-    if not (UPLOAD_DIR / req.filename).exists():
+    # verify uploaded file exists in UPLOAD_DIR
+    src_path = UPLOAD_DIR / req.filename
+    if not src_path.exists():
         raise HTTPException(status_code=404, detail="Uploaded file not found. Use 'stored_name' from /upload.")
 
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {
-        "job_id": job_id,
-        "filename": req.filename,
-        "status": "queued",
-        "created_at": datetime.utcnow().isoformat() + "Z",
-    }
-    background.add_task(_simulate_processing, job_id)
-    return {"message": f"Processing started for {req.filename}", "job_id": job_id, "status": "queued"}
+    # Create a new Job and layout
+    job = Job()
+    job.ensure_layout()
+
+    # Copy original file into the job's input folder
+    dest = job.dir() / "input" / Path(req.filename).name
+    try:
+        shutil.copy2(src_path, dest)
+        job.input_name = dest.name
+    except Exception as e:
+        job.state = JobState.error
+        job.error = f"Failed to stage input: {e}"
+        jobs[job.id] = job
+        return JSONResponse(job.to_api(), status_code=500)
+
+    # Register job (queued). We'll simulate processing like before.
+    jobs[job.id] = job
+
+    def _simulate_processing(job_id: str):
+        import time
+        j = jobs[job_id]
+        try:
+            j.state = JobState.processing
+            time.sleep(2)  # pretend work
+            j.state = JobState.done
+        except Exception as ex:
+            j.state = JobState.error
+            j.error = str(ex)
+
+    background.add_task(_simulate_processing, job.id)
+
+    return {"message": f"Processing started for {req.filename}", "job_id": job.id, "status": job.state.value}
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    job = JOBS.get(job_id)
+    job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found")
-    return job
+
+    # Provide a light artifact list (just files that exist) to help the UI later
+    artifacts = []
+    for sub in ["events", "audio", "outputs"]:
+        p = job.dir() / sub
+        if p.exists():
+            for x in p.glob("*"):
+                if x.is_file():
+                    artifacts.append(str(x.relative_to(job.dir())))
+
+    payload = job.to_api()
+    payload["artifacts"] = artifacts
+    return payload
 
 @app.get("/health")
 def health_check():
