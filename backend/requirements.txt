@@ -44,3 +44,5 @@ black
 ruff
 pytest
 pre-commit
+
+pyttsx3
