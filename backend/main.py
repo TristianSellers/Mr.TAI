@@ -1,14 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
-from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 from functools import lru_cache
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Dict, Literal
-from typing import Optional 
+from typing import Dict, Literal, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 from middleware_logging import register_request_logging
@@ -22,28 +20,32 @@ import mimetypes
 import re
 import subprocess
 
+# ---- Config / Env ----
 load_dotenv()
 
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
 port = int(os.getenv("PORT", 8000))
+
+# Introduce DATA_DIR (base) and make UPLOAD_DIR live under it
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+UPLOAD_DIR = DATA_DIR / "uploads"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Mr. TAI Backend", version="0.1.0")
 
 register_request_logging(app)
 register_error_handlers(app)
 
+# Use env-driven CORS instead of hard-coded list
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=[o.strip() for o in allowed_origins if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -116,6 +118,10 @@ def health_check():
     return {
         "status": "ok",
         "version": "0.1.0",
+        "port": port,
+        "dataDir": str(DATA_DIR.resolve()),
+        "uploadDir": str(UPLOAD_DIR.resolve()),
+        "allowedOrigins": [o.strip() for o in allowed_origins if o.strip()],
         "asr": {
             "model": os.getenv("ASR_MODEL_NAME", "tiny"),
             "device": os.getenv("ASR_DEVICE", "cpu"),
