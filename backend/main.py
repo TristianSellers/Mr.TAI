@@ -23,6 +23,7 @@ import ffmpeg
 import mimetypes
 import re
 import subprocess
+import shlex
 
 # ---- Config / Env ----
 load_dotenv()
@@ -194,9 +195,25 @@ def _probe_duration_seconds(path: str | os.PathLike[str]) -> float:
     except Exception:
         return 0.0
 
+def _is_audio(filename: str) -> bool:
+    mime, _ = mimetypes.guess_type(filename)
+    return (mime or "").startswith("audio/")
+
 def _is_video(filename: str) -> bool:
     mime, _ = mimetypes.guess_type(filename)
     return (mime or "").startswith("video/")
+
+def _ffprobe_can_decode(path: str) -> bool:
+    """
+    Quick sanity probe using ffprobe; returns True if the file has decodable streams.
+    """
+    try:
+        # -show_streams prints streams if any; suppress all logs except fatal
+        cmd = f'ffprobe -v error -show_streams -of json {shlex.quote(path)}'
+        out = subprocess.check_output(cmd, shell=True)
+        return b'"streams":' in out and b'codec_type' in out
+    except Exception:
+        return False
 
 def _extract_audio_to_wav(in_path: str, out_dir: Path) -> Path:
     out_path = out_dir / f"audio_{uuid.uuid4().hex}.wav"
@@ -235,7 +252,6 @@ async def _write_upload_stream(dest_path: Path, up: UploadFile, max_mb: int = MA
                 raise HTTPException(status_code=413, detail=f"File too large (> {max_mb} MB)")
             buf.write(chunk)
 
-
 @app.post("/process-upload")
 async def process_upload(
     file: UploadFile = File(...),
@@ -250,6 +266,9 @@ async def process_upload(
     # 1) Save original safely with unique name
     safe_base = _safe_name(file.filename)
     unique_name = f"{uuid.uuid4().hex}_{safe_base}"
+    # Reject non-media before writing a lot of work later
+    if not (_is_audio(safe_base) or _is_video(safe_base)):
+        return JSONResponse({"error": "Unsupported file type. Please upload audio or video."}, status_code=400)
     in_path = UPLOAD_DIR / unique_name
 
     try:
@@ -372,6 +391,14 @@ async def demo_commentary(req: CommentaryRequest):
     src = UPLOAD_DIR / req.filename
     if not src.exists():
         raise HTTPException(status_code=404, detail="Uploaded file not found")
+    
+    # 1.5) validate media type (reject non-audio/video early)
+    name = req.filename
+    if not (_is_audio(name) or _is_video(name)):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload audio or video.")
+
+    if not _ffprobe_can_decode(str(src)):
+        raise HTTPException(status_code=400, detail="File is not a valid/decodable media file.")
 
     # 2) ensure WAV
     media_type = "video" if _is_video(req.filename) else "audio"
