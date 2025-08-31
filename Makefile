@@ -6,7 +6,7 @@ ACT=. $(VENV)/bin/activate
 dev:
 	$(PY) -m venv $(VENV); \
 	$(ACT); pip install --upgrade pip; \
-	pip install -r backend/requirements.txt -r backend/requirements-dev.txt || true; \
+	pip install -r backend/requirements.txt -r backend/requirements.txt || true; \
 	pre-commit install
 
 run:
