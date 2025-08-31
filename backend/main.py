@@ -1,5 +1,6 @@
-from backend.core.models import Job, JobState  # NEW
-from backend.core.registry import jobs         # NEW
+from backend.core.models import Job, JobState  
+from backend.core.registry import jobs         
+from backend.providers.tts_local import synth_to_wav  
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
@@ -353,4 +354,13 @@ async def process_upload(
             "device": os.getenv("ASR_DEVICE", "cpu"),
             "compute_type": os.getenv("ASR_COMPUTE_TYPE", "int8"),
         },
+    }
+
+@app.post("/demo/say")
+def demo_say(text: str = "Hello from Mr. TAI!"):
+    demo_out = DATA_DIR / "demo" / "hello.wav"
+    synth_to_wav(text, demo_out)
+    return {
+        "message": "ok",
+        "audio": str(demo_out),
     }
