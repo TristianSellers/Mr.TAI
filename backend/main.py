@@ -465,3 +465,6 @@ async def demo_commentary(req: CommentaryRequest):
         "audio_url": to_static_url(out_path),
         "segments_used": min(req.max_lines, len(segments)),
     }
+
+from backend.routers.analyze_commentate import router as analyze_router
+app.include_router(analyze_router)
