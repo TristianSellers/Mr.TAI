@@ -35,6 +35,7 @@ uploads/
 data/
 tmp/
 cache/
+runs/
 
 # Large binaries (keep out of git)
 *.mp4

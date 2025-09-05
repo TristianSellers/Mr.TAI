@@ -5,6 +5,7 @@ from backend.steps.script import segments_to_commentary
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 from functools import lru_cache
@@ -35,6 +36,7 @@ port = int(os.getenv("PORT", 8000))
 REPO_ROOT = Path(__file__).resolve().parents[1]   # .../Mr.TAI
 DATA_DIR = Path(os.getenv("DATA_DIR", REPO_ROOT / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
+(DEMO_DIR := DATA_DIR / "demo").mkdir(parents=True, exist_ok=True)
 (DATA_DIR).mkdir(parents=True, exist_ok=True)
 (UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="Mr. TAI Backend", version="0.1.0")
@@ -50,6 +52,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve anything inside DATA_DIR at /static/*
+# That means files at DATA_DIR/<something> are accessible at /static/<something>
+app.mount("/static", StaticFiles(directory=str(DATA_DIR)), name="static")
+
 
 @app.get("/")
 def root():
@@ -202,6 +209,13 @@ def _is_audio(filename: str) -> bool:
 def _is_video(filename: str) -> bool:
     mime, _ = mimetypes.guess_type(filename)
     return (mime or "").startswith("video/")
+
+def to_static_url(p: str | os.PathLike[str]) -> str:
+    """Convert any absolute/relative path under DATA_DIR to /static URL."""
+    p_abs = Path(p).resolve()
+    data_abs = DATA_DIR.resolve()
+    rel = p_abs.relative_to(data_abs)  # raises if not under DATA_DIR (which we want)
+    return f"/static/{rel.as_posix()}"
 
 def _ffprobe_can_decode(path: str) -> bool:
     """
@@ -379,6 +393,7 @@ def demo_say(text: str = "Hello from Mr. TAI!"):
     return {
         "message": "ok",
         "audio": str(demo_out),
+        "audio_url": to_static_url(demo_out),
     }
 
 class CommentaryRequest(BaseModel):
@@ -447,5 +462,6 @@ async def demo_commentary(req: CommentaryRequest):
         "message": "ok",
         "commentary_text": text,
         "audio": str(out_path),
+        "audio_url": to_static_url(out_path),
         "segments_used": min(req.max_lines, len(segments)),
     }
