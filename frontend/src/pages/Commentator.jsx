@@ -16,7 +16,9 @@ export default function Commentator() {
   const [resp, setResp] = useState(null);
   const [error, setError] = useState(null);
 
-  const onSubmit = async () => {
+  const staticUrl = (u) => (u ? `${API_BASE}${u}` : "");
+
+  async function onSubmit() {
     if (!file) return setError("Pick an .mp4 first.");
     setError(null);
     setLoading(true);
@@ -36,9 +38,44 @@ export default function Commentator() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const staticUrl = (u) => (u ? `${API_BASE}${u}` : "");
+  async function onDemoMode() {
+    setError(null);
+    setLoading(true);
+    setResp(null);
+    try {
+      const r = await fetch(`${API_BASE}/demo/artifacts`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      setResp({
+        id: "demo",
+        text: j.text || "Demo commentary",
+        audio_url: j.audio_url || null,
+        video_url: j.video_url || null,
+        meta: { duration_s: 0, errors: null, usedManualContext: false },
+      });
+    } catch (e) {
+      setError(e?.message || "Failed to load demo artifacts");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function onReset() {
+    setFile(null);
+    setResp(null);
+    setError(null);
+    setForm({
+      home_team: "USC",
+      away_team: "UCLA",
+      score: "21-24",
+      quarter: "Q4",
+      clock: "0:42",
+      tone: "hype",
+      voice: "default",
+    });
+  }
 
   return (
     <div style={{ maxWidth: 720, margin: "40px auto", padding: 16 }}>
@@ -49,29 +86,36 @@ export default function Commentator() {
           type="file"
           accept="video/mp4,video/*"
           onChange={(e) => setFile(e.target.files?.[0] || null)}
+          disabled={loading}
         />
 
         <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
           <input placeholder="Home" value={form.home_team}
-                 onChange={(e) => setForm({ ...form, home_team: e.target.value })}/>
+                 onChange={(e) => setForm({ ...form, home_team: e.target.value })} disabled={loading}/>
           <input placeholder="Away" value={form.away_team}
-                 onChange={(e) => setForm({ ...form, away_team: e.target.value })}/>
+                 onChange={(e) => setForm({ ...form, away_team: e.target.value })} disabled={loading}/>
           <input placeholder="Score (e.g., 21-24)" value={form.score}
-                 onChange={(e) => setForm({ ...form, score: e.target.value })}/>
+                 onChange={(e) => setForm({ ...form, score: e.target.value })} disabled={loading}/>
           <input placeholder="Quarter (Q1–Q4/OT)" value={form.quarter}
-                 onChange={(e) => setForm({ ...form, quarter: e.target.value })}/>
+                 onChange={(e) => setForm({ ...form, quarter: e.target.value })} disabled={loading}/>
           <input placeholder="Clock (e.g., 0:42)" value={form.clock}
-                 onChange={(e) => setForm({ ...form, clock: e.target.value })}/>
-          <select value={form.tone} onChange={(e) => setForm({ ...form, tone: e.target.value })}>
+                 onChange={(e) => setForm({ ...form, clock: e.target.value })} disabled={loading}/>
+          <select value={form.tone} onChange={(e) => setForm({ ...form, tone: e.target.value })} disabled={loading}>
             <option value="hype">hype</option>
             <option value="neutral">neutral</option>
             <option value="radio">radio</option>
           </select>
         </div>
 
-        <button onClick={onSubmit} disabled={loading}>
-          {loading ? "Analyzing…" : "Analyze & Commentate"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onSubmit} disabled={loading}>
+            {loading ? "Working…" : "Analyze & Commentate"}
+          </button>
+          <button onClick={onDemoMode} disabled={loading}>
+            Demo Mode (prefilled backup)
+          </button>
+          <button onClick={onReset} disabled={loading}>Reset</button>
+        </div>
 
         {error && <div style={{ color: "crimson" }}>{error}</div>}
 
@@ -98,7 +142,10 @@ export default function Commentator() {
               </div>
             )}
 
-            <small>Latency: {resp.meta?.duration_s?.toFixed?.(3)}s</small>
+            <small>
+              Latency: {resp.meta?.duration_s != null ? resp.meta.duration_s.toFixed?.(3) : "—"}s
+              {resp.meta?.usedManualContext ? " • manual context" : ""}
+            </small>
             {resp.meta?.errors && <pre style={{ color: "crimson" }}>{JSON.stringify(resp.meta.errors, null, 2)}</pre>}
           </div>
         )}
