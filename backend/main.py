@@ -468,3 +468,6 @@ async def demo_commentary(req: CommentaryRequest):
 
 from backend.routers.analyze_commentate import router as analyze_router
 app.include_router(analyze_router)
+
+from backend.routers.demo import router as demo_router
+app.include_router(demo_router)
