@@ -46,3 +46,4 @@ pytest
 pre-commit
 
 pyttsx3
+aiofiles
