@@ -1,6 +1,6 @@
 # backend/services/mux.py
 from pathlib import Path
-import ffmpeg
+import subprocess, shlex
 from backend.main import DATA_DIR
 
 DUB_DIR = (DATA_DIR / "uploads" / "dubbed")
@@ -15,29 +15,10 @@ def mux_audio_video(video_path: str | Path, audio_path: str | Path, out_path: st
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Copy video, encode audio to AAC, truncate to shortest stream
-    (
-        ffmpeg
-        .input(str(video_path))
-        .output(str(audio_path))
-    )  # no-op, but keeps parity if you later pre-process
-
-    (
-        ffmpeg
-        .input(str(video_path))
-        .input(str(audio_path))
-        .output(
-            str(out_path),
-            **{
-                "c:v": "copy",
-                "c:a": "aac",
-                "b:a": "128k",
-                "shortest": None,  # flag
-                "map": ["0:v:0", "1:a:0"],
-                "loglevel": "error",
-            },
-        )
-        .overwrite_output()
-        .run()
+    cmd = (
+        f'ffmpeg -y -i {shlex.quote(str(video_path))} -i {shlex.quote(str(audio_path))} '
+        f'-c:v copy -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest '
+        f'{shlex.quote(str(out_path))}'
     )
+    subprocess.run(shlex.split(cmd), check=True)
     return out_path
