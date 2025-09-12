@@ -32,7 +32,12 @@ import shlex
 # =========================
 # ---- Config / Env ----
 # =========================
-load_dotenv()
+ROOT = Path(__file__).resolve().parents[1]
+# load in increasing precedence
+load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / ".env.local", override=True)
+load_dotenv(ROOT / "backend" / ".env", override=True)
+load_dotenv(ROOT / "backend" / ".env.local", override=True)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]  # .../Mr.TAI
 
