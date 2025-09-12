@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from pathlib import Path
 import uuid, time, subprocess, shlex
 
-from backend.services.llm import generate_commentary
+from backend.services.llm_providers import get_llm
 from backend.services.runlog import append_run_log
 from backend.services.mux import mux_audio_video
 
@@ -40,16 +40,28 @@ def _wav_to_mp3(wav_path: Path) -> Path:
     subprocess.run(shlex.split(cmd), check=True)
     return mp3_path
 
+def _build_llm_prompt(context: dict, transcript: str | None = None) -> str:
+    tone = context.get("tone") or "hype"
+    sport = context.get("sport") or "football"
+    return (
+        f"You are a live {sport} commentator. Tone: {tone}. "
+        f"Write a concise, energetic call (~12–18s of speech). "
+        f"Use the provided context if relevant. Avoid profanity.\n\n"
+        f"CONTEXT: {context}\n\n"
+        f"TRANSCRIPT: {transcript or ''}\n\n"
+        f"Commentary:"
+    )
+
 @router.post("/analyze_commentate", response_model=AnalyzeOut)
 async def analyze_commentate(
     file: UploadFile = File(...),
     home_team: str | None = Form(default=None),
     away_team: str | None = Form(default=None),
-    score: str | None = Form(default=None),     # e.g., "21-24"
-    quarter: str | None = Form(default=None),   # e.g., "Q4"
-    clock: str | None = Form(default=None),     # e.g., "0:42"
+    score: str | None = Form(default=None),
+    quarter: str | None = Form(default=None),
+    clock: str | None = Form(default=None),
     tone: str = Form(default="play-by-play"),
-    voice: str = Form(default="default"),       # reserved for future provider switch
+    voice: str = Form(default="default"),
 ):
     t0 = time.time()
     run_id = f"run_{uuid.uuid4().hex[:10]}"
@@ -73,9 +85,11 @@ async def analyze_commentate(
         "tone": tone,
     }
 
-    # 2) Generate text
+    # 2) Generate text via LLM
     try:
-        text = generate_commentary(context, tone=tone)
+        llm = get_llm()
+        prompt = _build_llm_prompt(context)
+        text = llm.generate(prompt, meta={"tone": tone})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
@@ -87,7 +101,6 @@ async def analyze_commentate(
     try:
         audio_wav = TTS_DIR / f"{run_id}.wav"
         synth_to_wav(text, audio_wav)
-        # optional: also make an mp3 for convenience on the frontend
         audio_mp3 = _wav_to_mp3(audio_wav)
     except Exception as e:
         errors.append(f"TTS error: {e}")
@@ -95,7 +108,6 @@ async def analyze_commentate(
     # 4) Mux (if we have audio)
     if audio_wav and audio_wav.exists():
         try:
-            # mux accepts wav just fine; will encode as AAC
             video_out = mux_audio_video(str(in_path), str(audio_wav))
         except Exception as e:
             errors.append(f"Mux error: {e}")
@@ -123,7 +135,7 @@ async def analyze_commentate(
         meta={
             "usedManualContext": any([home_team, away_team, score, quarter, clock]),
             "duration_s": elapsed,
-            "provider": {"llm": "stub", "tts": "local_wav"},
+            "provider": {"llm": type(llm).__name__, "tts": "local_wav"},
             "errors": errors or None,
         },
     )
