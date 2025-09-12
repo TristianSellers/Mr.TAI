@@ -12,6 +12,8 @@ def env_preview():
     upload_dir = data_dir / "uploads"
     demo_dir = data_dir / "demo"
 
+    has_eleven_key = bool(os.getenv("ELEVENLABS_API_KEY"))
+
     return {
         "status": "ok",
         # server
@@ -35,5 +37,6 @@ def env_preview():
         "TTS": {
             "provider": os.getenv("TTS_PROVIDER", "elevenlabs"),
             "elevenlabs_voice_id": os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
+            "has_api_key": has_eleven_key,  # boolean only, no secret
         },
     }
