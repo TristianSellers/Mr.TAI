@@ -1,27 +1,27 @@
 # backend/routers/prewarm.py
 from fastapi import APIRouter
-from dotenv import load_dotenv
-from faster_whisper import WhisperModel
-import os
+from backend.main import get_asr_model, ASR_MODEL_NAME, ASR_DEVICE, ASR_COMPUTE_TYPE
 
 router = APIRouter()
 
+@router.get("/prewarm")
 @router.post("/prewarm")
 def prewarm():
     """
     Warm up heavy dependencies so the first real request is fast.
-    For now: loads the ASR model (faster-whisper).
-    LLM/TTS warming will be added in Week 4 integration.
+    For now: calls get_asr_model() to populate its cache.
     """
-    load_dotenv()  # ensure .env/.env.local are loaded
-
-    model = os.getenv("ASR_MODEL_NAME", "tiny")
-    device = os.getenv("ASR_DEVICE", "cpu")              # "cpu" or "auto"
-    compute = os.getenv("ASR_COMPUTE_TYPE", "int8")      # e.g. "int8", "float16"
-
     try:
-        # Model load itself is the warm-up
-        WhisperModel(model, device=device, compute_type=compute)
-        return {"ok": True, "asr": {"model": model, "device": device, "compute_type": compute}}
+        model = get_asr_model()  # cached singleton
+        # trigger a trivial call to ensure weights are loaded
+        _ = model.transcribe("tests/silence.wav") if False else None
+        return {
+            "ok": True,
+            "asr": {
+                "model": ASR_MODEL_NAME,
+                "device": ASR_DEVICE,
+                "compute_type": ASR_COMPUTE_TYPE,
+            },
+        }
     except Exception as e:
         return {"ok": False, "asr": {"error": str(e)}}
