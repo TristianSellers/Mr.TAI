@@ -457,3 +457,6 @@ app.include_router(analyze_router)
 
 from backend.routers.demo import router as demo_router
 app.include_router(demo_router)
+
+from backend.routers.health import router as health_router
+app.include_router(health_router)
