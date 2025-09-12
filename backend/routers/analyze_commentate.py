@@ -5,12 +5,12 @@ from pathlib import Path
 import uuid, time, subprocess, shlex
 
 from backend.services.llm_providers import get_llm
+from backend.services.tts_providers import get_tts
 from backend.services.runlog import append_run_log
 from backend.services.mux import mux_audio_video
 
 # pull shared objects from main
 from backend.main import DATA_DIR, UPLOAD_DIR, to_static_url
-from backend.providers.tts_local import synth_to_wav
 
 router = APIRouter()
 
@@ -93,22 +93,31 @@ async def analyze_commentate(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
-    audio_wav = None
-    audio_mp3 = None
-    video_out = None
+    audio_wav: Path | None = None
+    audio_mp3: Path | None = None
+    video_out: Path | None = None
+    tts = None  # define in outer scope for safe meta reporting
 
-    # 3) TTS (local wav for now)
+    # 3) TTS (provider-based mp3)
     try:
-        audio_wav = TTS_DIR / f"{run_id}.wav"
-        synth_to_wav(text, audio_wav)
-        audio_mp3 = _wav_to_mp3(audio_wav)
+        tts = get_tts()
+        audio_mp3_path = tts.synth_to_file(text, TTS_DIR)  # returns MP3 path
+        audio_mp3 = Path(audio_mp3_path)
     except Exception as e:
         errors.append(f"TTS error: {e}")
+        audio_mp3 = None
 
-    # 4) Mux (if we have audio)
-    if audio_wav and audio_wav.exists():
+    # 4) Mux (convert mp3 -> wav if needed, then mux)
+    if audio_mp3 and audio_mp3.exists():
         try:
-            video_out = mux_audio_video(str(in_path), str(audio_wav))
+            # Convert MP3 to WAV (mono 16k) for mux if your mux expects WAV
+            audio_wav = audio_mp3.with_suffix(".wav")
+            cmd = f'ffmpeg -y -i {shlex.quote(str(audio_mp3))} -ac 1 -ar 16000 {shlex.quote(str(audio_wav))}'
+            subprocess.run(shlex.split(cmd), check=True)
+
+            # Now mux audio_wav with input video
+            video_out_path = mux_audio_video(str(in_path), str(audio_wav))
+            video_out = Path(video_out_path) if isinstance(video_out_path, str) else video_out_path
         except Exception as e:
             errors.append(f"Mux error: {e}")
 
@@ -126,16 +135,18 @@ async def analyze_commentate(
         "elapsed_s": elapsed,
     })
 
+    tts_name = type(tts).__name__ if tts else "Unavailable"
+
     return AnalyzeOut(
         id=run_id,
         text=text,
-        audio_url=(to_static_url(audio_mp3) if audio_mp3 and audio_mp3.exists() else
-                   (to_static_url(audio_wav) if audio_wav and audio_wav.exists() else None)),
+        audio_url=(to_static_url(audio_mp3) if (audio_mp3 and audio_mp3.exists()) else
+                   (to_static_url(audio_wav) if (audio_wav and audio_wav.exists()) else None)),
         video_url=(to_static_url(video_out) if video_out else None),
         meta={
             "usedManualContext": any([home_team, away_team, score, quarter, clock]),
             "duration_s": elapsed,
-            "provider": {"llm": type(llm).__name__, "tts": "local_wav"},
+            "provider": {"llm": type(llm).__name__, "tts": tts_name},
             "errors": errors or None,
         },
     )
