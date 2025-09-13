@@ -468,3 +468,6 @@ app.include_router(health_router)
 
 from backend.routers.prewarm import router as prewarm_router
 app.include_router(prewarm_router)
+
+from backend.routers.prewarm import router as prewarm_router
+app.include_router(prewarm_router)
