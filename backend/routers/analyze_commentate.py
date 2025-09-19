@@ -90,7 +90,7 @@ async def analyze_commentate(
     # 3) TTS (provider-based mp3)
     try:
         tts = get_tts()
-        audio_mp3_path = tts.synth_to_file(text, TTS_DIR)  # returns MP3 path
+        audio_mp3_path = tts.synth_to_file(text, TTS_DIR, tone=tone)  # <— pass tone  # returns MP3 path
         audio_mp3 = Path(audio_mp3_path)
     except Exception as e:
         errors.append(f"TTS error: {e}")
