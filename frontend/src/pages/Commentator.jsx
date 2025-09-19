@@ -12,6 +12,7 @@ export default function Commentator() {
     tone: "hype",
     voice: "default",
   });
+  const [audioOnly, setAudioOnly] = useState(false);
   const [loading, setLoading] = useState(false);
   const [resp, setResp] = useState(null);
   const [error, setError] = useState(null);
@@ -19,14 +20,19 @@ export default function Commentator() {
   const staticUrl = (u) => (u ? `${API_BASE}${u}` : "");
 
   async function onSubmit() {
-    if (!file) return setError("Pick an .mp4 first.");
+    // guard: require a file unless audio-only
+    if (!file && !audioOnly) {
+      return setError("Select a clip or enable “Audio only”.");
+    }
+
     setError(null);
     setLoading(true);
     setResp(null);
 
     const body = new FormData();
-    body.append("file", file);
+    if (file) body.append("file", file);
     Object.entries(form).forEach(([k, v]) => body.append(k, v));
+    body.append("audio_only", String(audioOnly));
 
     try {
       const r = await fetch(`${API_BASE}/analyze_commentate`, { method: "POST", body });
@@ -66,6 +72,7 @@ export default function Commentator() {
     setFile(null);
     setResp(null);
     setError(null);
+    setAudioOnly(false);
     setForm({
       home_team: "USC",
       away_team: "UCLA",
@@ -77,17 +84,30 @@ export default function Commentator() {
     });
   }
 
+  const canAnalyze = !!file || audioOnly;
+
   return (
     <div style={{ maxWidth: 720, margin: "40px auto", padding: 16 }}>
       <h1>Mr. TAI — Madden Commentator (MVP)</h1>
 
       <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
-        <input
-          type="file"
-          accept="video/mp4,video/*"
-          onChange={(e) => setFile(e.target.files?.[0] || null)}
-          disabled={loading}
-        />
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <input
+            type="file"
+            accept="video/mp4,video/*,audio/*"
+            onChange={(e) => setFile(e.target.files?.[0] || null)}
+            disabled={loading}
+          />
+          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={audioOnly}
+              onChange={(e) => setAudioOnly(e.target.checked)}
+              disabled={loading}
+            />
+            <span>Audio only (no clip)</span>
+          </label>
+        </div>
 
         <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
           <input placeholder="Home" value={form.home_team}
@@ -107,14 +127,19 @@ export default function Commentator() {
           </select>
         </div>
 
-        <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={onSubmit} disabled={loading}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button onClick={onSubmit} disabled={loading || !canAnalyze}>
             {loading ? "Working…" : "Analyze & Commentate"}
           </button>
           <button onClick={onDemoMode} disabled={loading}>
             Demo Mode (prefilled backup)
           </button>
           <button onClick={onReset} disabled={loading}>Reset</button>
+          {!canAnalyze && (
+            <span style={{ marginLeft: 8, color: "#b45309", fontSize: 12 }}>
+              Select a clip or enable “Audio only”.
+            </span>
+          )}
         </div>
 
         {error && <div style={{ color: "crimson" }}>{error}</div>}
@@ -145,6 +170,8 @@ export default function Commentator() {
             <small>
               Latency: {resp.meta?.duration_s != null ? resp.meta.duration_s.toFixed?.(3) : "—"}s
               {resp.meta?.usedManualContext ? " • manual context" : ""}
+              {resp.meta?.audio_only ? " • audio-only" : ""}
+              {resp.meta?.prompt_tone ? ` • tone: ${resp.meta.prompt_tone}` : ""}
             </small>
             {resp.meta?.errors && <pre style={{ color: "crimson" }}>{JSON.stringify(resp.meta.errors, null, 2)}</pre>}
           </div>
