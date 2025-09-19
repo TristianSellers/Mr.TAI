@@ -6,23 +6,35 @@ import pathlib, uuid, os, requests
 
 
 class TTSClient(Protocol):
-    def synth_to_file(self, text: str, out_dir: str | pathlib.Path) -> str: ...
+    def synth_to_file(
+        self, text: str, out_dir: str | pathlib.Path, tone: str | None = None
+    ) -> str: ...
 
 
-# -------- ElevenLabs (default) --------
+# -------- ElevenLabs (default, tone-aware) --------
 class ElevenLabsTTS:
+    TONE_SETTINGS = {
+        "hype":   {"stability": 0.45, "similarity_boost": 0.85},
+        "radio":  {"stability": 0.65, "similarity_boost": 0.75},
+        "neutral":{"stability": 0.55, "similarity_boost": 0.80},
+    }
+
     def __init__(self):
-        # strip to avoid newline/space issues
         self.key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
         if not self.key:
             raise RuntimeError("ELEVENLABS_API_KEY missing")
         self.voice_id = (os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM") or "").strip()
         self.model = (os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2") or "").strip()
 
-    def synth_to_file(self, text: str, out_dir: str | pathlib.Path) -> str:
+    def synth_to_file(
+        self, text: str, out_dir: str | pathlib.Path, tone: str | None = None
+    ) -> str:
         out_dir = pathlib.Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / f"tts_{uuid.uuid4().hex}.mp3"
+
+        tone_key = (tone or "neutral").lower()
+        settings = self.TONE_SETTINGS.get(tone_key, self.TONE_SETTINGS["neutral"])
 
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}"
         headers = {
@@ -30,22 +42,17 @@ class ElevenLabsTTS:
             "accept": "audio/mpeg",
             "content-type": "application/json",
         }
-        payload = {
-            "text": text,
-            "model_id": self.model,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-        }
+        payload = {"text": text, "model_id": self.model, "voice_settings": settings}
 
         r = requests.post(url, json=payload, headers=headers, timeout=60)
         if r.status_code != 200:
-            # basic diagnostics without leaking the key
             snippet = r.text[:200].replace(self.key, "***")
             raise RuntimeError(f"ElevenLabs {r.status_code}: {snippet}")
         out.write_bytes(r.content)
         return str(out)
 
 
-# -------- OpenAI (optional) --------
+# -------- OpenAI (optional, tone accepted but ignored) --------
 class OpenAITTS:
     def __init__(self):
         from openai import OpenAI
@@ -56,12 +63,14 @@ class OpenAITTS:
         self.model = (os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts") or "").strip()
         self.voice = (os.getenv("OPENAI_TTS_VOICE", "alloy") or "").strip()
 
-    def synth_to_file(self, text: str, out_dir: str | pathlib.Path) -> str:
+    def synth_to_file(
+        self, text: str, out_dir: str | pathlib.Path, tone: str | None = None
+    ) -> str:
         out_dir = pathlib.Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / f"tts_{uuid.uuid4().hex}.mp3"
 
-        # Prefer streaming API per OpenAI v1 SDK
+        # Prefer streaming API (OpenAI v1 SDK)
         try:
             with self.client.audio.speech.with_streaming_response.create(
                 model=self.model,
@@ -71,7 +80,7 @@ class OpenAITTS:
                 resp.stream_to_file(str(out))
                 return str(out)
         except AttributeError:
-            # Fallback to non-streaming (older/newer SDK shapes)
+            # Fallback: write bytes if exposed
             resp = self.client.audio.speech.create(
                 model=self.model,
                 voice=self.voice,
