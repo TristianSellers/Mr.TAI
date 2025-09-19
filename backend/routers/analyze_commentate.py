@@ -8,6 +8,7 @@ from backend.services.llm_providers import get_llm
 from backend.services.tts_providers import get_tts
 from backend.services.runlog import append_run_log
 from backend.services.mux import mux_audio_video
+from backend.services.tone_profiles import build_llm_prompt, normalize_tone  # <— NEW
 
 # pull shared objects from main
 from backend.main import DATA_DIR, UPLOAD_DIR, to_static_url
@@ -39,18 +40,6 @@ def _wav_to_mp3(wav_path: Path) -> Path:
     cmd = f'ffmpeg -y -i {shlex.quote(str(wav_path))} -b:a 128k {shlex.quote(str(mp3_path))}'
     subprocess.run(shlex.split(cmd), check=True)
     return mp3_path
-
-def _build_llm_prompt(context: dict, transcript: str | None = None) -> str:
-    tone = context.get("tone") or "hype"
-    sport = context.get("sport") or "football"
-    return (
-        f"You are a live {sport} commentator. Tone: {tone}. "
-        f"Write a concise, energetic call (~12–18s of speech). "
-        f"Use the provided context if relevant. Avoid profanity.\n\n"
-        f"CONTEXT: {context}\n\n"
-        f"TRANSCRIPT: {transcript or ''}\n\n"
-        f"Commentary:"
-    )
 
 @router.post("/analyze_commentate", response_model=AnalyzeOut)
 async def analyze_commentate(
@@ -85,18 +74,18 @@ async def analyze_commentate(
         "tone": tone,
     }
 
-    # 2) Generate text via LLM
+    # 2) Generate text via LLM (tone-aware)
     try:
         llm = get_llm()
-        prompt = _build_llm_prompt(context)
-        text = llm.generate(prompt, meta={"tone": tone})
+        prompt = build_llm_prompt(context)  # tone handled inside
+        text = llm.generate(prompt, meta={"tone": normalize_tone(tone)})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
     audio_wav: Path | None = None
     audio_mp3: Path | None = None
     video_out: Path | None = None
-    tts = None  # define in outer scope for safe meta reporting
+    tts = None
 
     # 3) TTS (provider-based mp3)
     try:
@@ -110,12 +99,10 @@ async def analyze_commentate(
     # 4) Mux (convert mp3 -> wav if needed, then mux)
     if audio_mp3 and audio_mp3.exists():
         try:
-            # Convert MP3 to WAV (mono 16k) for mux if your mux expects WAV
             audio_wav = audio_mp3.with_suffix(".wav")
             cmd = f'ffmpeg -y -i {shlex.quote(str(audio_mp3))} -ac 1 -ar 16000 {shlex.quote(str(audio_wav))}'
             subprocess.run(shlex.split(cmd), check=True)
 
-            # Now mux audio_wav with input video
             video_out_path = mux_audio_video(str(in_path), str(audio_wav))
             video_out = Path(video_out_path) if isinstance(video_out_path, str) else video_out_path
         except Exception as e:
@@ -147,6 +134,7 @@ async def analyze_commentate(
             "usedManualContext": any([home_team, away_team, score, quarter, clock]),
             "duration_s": elapsed,
             "provider": {"llm": type(llm).__name__, "tts": tts_name},
+            "prompt_tone": normalize_tone(tone),
             "errors": errors or None,
         },
     )
