@@ -85,7 +85,7 @@ export default function Commentator() {
   }
 
   const canAnalyze = !!file || audioOnly;
-  const labelStyle = { display: "grid", gap: 6, fontSize: 12, color: "#374151" };
+  const labelStyle = { display: "grid", gap: 6, fontSize: 12, color: "#374151", lineHeight: 1.25 };
   const inputStyle = { padding: 8, border: "1px solid #d1d5db", borderRadius: 6 };
 
   return (
@@ -115,7 +115,8 @@ export default function Commentator() {
           </label>
         </div>
 
-        <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
+        {/* Two-column, one-field-per-cell to avoid vertical offset */}
+        <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr", alignItems: "end" }}>
           <label style={labelStyle}>
             <span>Home Team</span>
             <input
@@ -169,36 +170,37 @@ export default function Commentator() {
             />
           </label>
 
-          <div style={{ display: "grid", gap: 10 }}>
-            <label style={labelStyle}>
-              <span>Tone</span>
-              <select
-                style={inputStyle}
-                value={form.tone}
-                onChange={(e) => setForm({ ...form, tone: e.target.value })}
-                disabled={loading}
-              >
-                <option value="hype">hype</option>
-                <option value="neutral">neutral</option>
-                <option value="radio">radio</option>
-              </select>
-            </label>
+          <label style={labelStyle}>
+            <span>Tone</span>
+            <select
+              style={inputStyle}
+              value={form.tone}
+              onChange={(e) => setForm({ ...form, tone: e.target.value })}
+              disabled={loading}
+            >
+              <option value="hype">hype</option>
+              <option value="neutral">neutral</option>
+              <option value="radio">radio</option>
+            </select>
+          </label>
 
-            <label style={labelStyle}>
-              <span>Bias (POV)</span>
-              <select
-                style={inputStyle}
-                value={form.bias}
-                onChange={(e) => setForm({ ...form, bias: e.target.value })}
-                disabled={loading}
-                title="Commentator POV bias"
-              >
-                <option value="neutral">neutral</option>
-                <option value="home">home</option>
-                <option value="away">away</option>
-              </select>
-            </label>
-          </div>
+          {/* spacer to keep symmetry */}
+          <div aria-hidden="true" />
+
+          <label style={labelStyle}>
+            <span>Bias (POV)</span>
+            <select
+              style={inputStyle}
+              value={form.bias}
+              onChange={(e) => setForm({ ...form, bias: e.target.value })}
+              disabled={loading}
+              title="Commentator POV bias"
+            >
+              <option value="neutral">neutral</option>
+              <option value="home">home</option>
+              <option value="away">away</option>
+            </select>
+          </label>
         </div>
 
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
