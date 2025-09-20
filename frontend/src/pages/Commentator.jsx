@@ -10,7 +10,7 @@ export default function Commentator() {
     quarter: "Q4",
     clock: "0:42",
     tone: "hype",
-    bias: "neutral", // NEW
+    bias: "neutral",
     voice: "default",
   });
   const [audioOnly, setAudioOnly] = useState(false);
@@ -21,11 +21,9 @@ export default function Commentator() {
   const staticUrl = (u) => (u ? `${API_BASE}${u}` : "");
 
   async function onSubmit() {
-    // guard: require a file unless audio-only
     if (!file && !audioOnly) {
       return setError("Select a clip or enable “Audio only”.");
     }
-
     setError(null);
     setLoading(true);
     setResp(null);
@@ -81,12 +79,14 @@ export default function Commentator() {
       quarter: "Q4",
       clock: "0:42",
       tone: "hype",
-      bias: "neutral", // NEW
+      bias: "neutral",
       voice: "default",
     });
   }
 
   const canAnalyze = !!file || audioOnly;
+  const labelStyle = { display: "grid", gap: 6, fontSize: 12, color: "#374151", lineHeight: 1.25 };
+  const inputStyle = { padding: 8, border: "1px solid #d1d5db", borderRadius: 6 };
 
   return (
     <div style={{ maxWidth: 720, margin: "40px auto", padding: 16 }}>
@@ -94,12 +94,16 @@ export default function Commentator() {
 
       <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <input
-            type="file"
-            accept="video/mp4,video/*,audio/*"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
-            disabled={loading}
-          />
+          <label style={{ ...labelStyle, margin: 0 }}>
+            <span>Clip (video/audio)</span>
+            <input
+              type="file"
+              accept="video/mp4,video/*,audio/*"
+              onChange={(e) => setFile(e.target.files?.[0] || null)}
+              disabled={loading}
+            />
+          </label>
+
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <input
               type="checkbox"
@@ -111,39 +115,65 @@ export default function Commentator() {
           </label>
         </div>
 
-        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
-          <input
-            placeholder="Home"
-            value={form.home_team}
-            onChange={(e) => setForm({ ...form, home_team: e.target.value })}
-            disabled={loading}
-          />
-          <input
-            placeholder="Away"
-            value={form.away_team}
-            onChange={(e) => setForm({ ...form, away_team: e.target.value })}
-            disabled={loading}
-          />
-          <input
-            placeholder="Score (e.g., 21-24)"
-            value={form.score}
-            onChange={(e) => setForm({ ...form, score: e.target.value })}
-            disabled={loading}
-          />
-          <input
-            placeholder="Quarter (Q1–Q4/OT)"
-            value={form.quarter}
-            onChange={(e) => setForm({ ...form, quarter: e.target.value })}
-            disabled={loading}
-          />
-          <input
-            placeholder="Clock (e.g., 0:42)"
-            value={form.clock}
-            onChange={(e) => setForm({ ...form, clock: e.target.value })}
-            disabled={loading}
-          />
-          <div style={{ display: "flex", gap: 8 }}>
+        {/* Two-column, one-field-per-cell to avoid vertical offset */}
+        <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr", alignItems: "end" }}>
+          <label style={labelStyle}>
+            <span>Home Team</span>
+            <input
+              style={inputStyle}
+              value={form.home_team}
+              onChange={(e) => setForm({ ...form, home_team: e.target.value })}
+              disabled={loading}
+            />
+          </label>
+
+          <label style={labelStyle}>
+            <span>Away Team</span>
+            <input
+              style={inputStyle}
+              value={form.away_team}
+              onChange={(e) => setForm({ ...form, away_team: e.target.value })}
+              disabled={loading}
+            />
+          </label>
+
+          <label style={labelStyle}>
+            <span>Score</span>
+            <input
+              style={inputStyle}
+              placeholder="e.g., 21-24"
+              value={form.score}
+              onChange={(e) => setForm({ ...form, score: e.target.value })}
+              disabled={loading}
+            />
+          </label>
+
+          <label style={labelStyle}>
+            <span>Quarter</span>
+            <input
+              style={inputStyle}
+              placeholder="Q1–Q4/OT"
+              value={form.quarter}
+              onChange={(e) => setForm({ ...form, quarter: e.target.value })}
+              disabled={loading}
+            />
+          </label>
+
+          <label style={labelStyle}>
+            <span>Clock</span>
+            <input
+              style={inputStyle}
+              placeholder="e.g., 0:42"
+              value={form.clock}
+              onChange={(e) => setForm({ ...form, clock: e.target.value })}
+              disabled={loading}
+            />
+          </label>
+
+          <label style={labelStyle}>
+            <span>Tone</span>
             <select
+              style={inputStyle}
               value={form.tone}
               onChange={(e) => setForm({ ...form, tone: e.target.value })}
               disabled={loading}
@@ -152,18 +182,25 @@ export default function Commentator() {
               <option value="neutral">neutral</option>
               <option value="radio">radio</option>
             </select>
-            {/* NEW: Bias selector */}
+          </label>
+
+          {/* spacer to keep symmetry */}
+          <div aria-hidden="true" />
+
+          <label style={labelStyle}>
+            <span>Bias (POV)</span>
             <select
+              style={inputStyle}
               value={form.bias}
               onChange={(e) => setForm({ ...form, bias: e.target.value })}
               disabled={loading}
               title="Commentator POV bias"
             >
-              <option value="neutral">bias: neutral</option>
-              <option value="home">bias: home</option>
-              <option value="away">bias: away</option>
+              <option value="neutral">neutral</option>
+              <option value="home">home</option>
+              <option value="away">away</option>
             </select>
-          </div>
+          </label>
         </div>
 
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -196,11 +233,7 @@ export default function Commentator() {
               <div>
                 <h3>Audio</h3>
                 <audio controls src={staticUrl(resp.audio_url)} />
-                <div>
-                  <a href={staticUrl(resp.audio_url)} download>
-                    Download audio
-                  </a>
-                </div>
+                <div><a href={staticUrl(resp.audio_url)} download>Download audio</a></div>
               </div>
             )}
 
@@ -212,28 +245,19 @@ export default function Commentator() {
                   src={staticUrl(resp.video_url)}
                   style={{ width: "100%", borderRadius: 8 }}
                 />
-                <div>
-                  <a href={staticUrl(resp.video_url)} download>
-                    Download video
-                  </a>
-                </div>
+                <div><a href={staticUrl(resp.video_url)} download>Download video</a></div>
               </div>
             )}
 
             <small>
-              Latency:{" "}
-              {resp.meta?.duration_s != null
-                ? resp.meta.duration_s.toFixed?.(3)
-                : "—"}
+              Latency: {resp.meta?.duration_s != null ? resp.meta.duration_s.toFixed?.(3) : "—"}s
               {resp.meta?.usedManualContext ? " • manual context" : ""}
               {resp.meta?.audio_only ? " • audio-only" : ""}
               {resp.meta?.prompt_tone ? ` • tone: ${resp.meta.prompt_tone}` : ""}
               {resp.meta?.prompt_bias ? ` • bias: ${resp.meta.prompt_bias}` : ""}
             </small>
             {resp.meta?.errors && (
-              <pre style={{ color: "crimson" }}>
-                {JSON.stringify(resp.meta.errors, null, 2)}
-              </pre>
+              <pre style={{ color: "crimson" }}>{JSON.stringify(resp.meta.errors, null, 2)}</pre>
             )}
           </div>
         )}
