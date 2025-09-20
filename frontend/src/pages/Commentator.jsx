@@ -10,6 +10,7 @@ export default function Commentator() {
     quarter: "Q4",
     clock: "0:42",
     tone: "hype",
+    bias: "neutral", // NEW
     voice: "default",
   });
   const [audioOnly, setAudioOnly] = useState(false);
@@ -80,6 +81,7 @@ export default function Commentator() {
       quarter: "Q4",
       clock: "0:42",
       tone: "hype",
+      bias: "neutral", // NEW
       voice: "default",
     });
   }
@@ -110,21 +112,58 @@ export default function Commentator() {
         </div>
 
         <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
-          <input placeholder="Home" value={form.home_team}
-                 onChange={(e) => setForm({ ...form, home_team: e.target.value })} disabled={loading}/>
-          <input placeholder="Away" value={form.away_team}
-                 onChange={(e) => setForm({ ...form, away_team: e.target.value })} disabled={loading}/>
-          <input placeholder="Score (e.g., 21-24)" value={form.score}
-                 onChange={(e) => setForm({ ...form, score: e.target.value })} disabled={loading}/>
-          <input placeholder="Quarter (Q1–Q4/OT)" value={form.quarter}
-                 onChange={(e) => setForm({ ...form, quarter: e.target.value })} disabled={loading}/>
-          <input placeholder="Clock (e.g., 0:42)" value={form.clock}
-                 onChange={(e) => setForm({ ...form, clock: e.target.value })} disabled={loading}/>
-          <select value={form.tone} onChange={(e) => setForm({ ...form, tone: e.target.value })} disabled={loading}>
-            <option value="hype">hype</option>
-            <option value="neutral">neutral</option>
-            <option value="radio">radio</option>
-          </select>
+          <input
+            placeholder="Home"
+            value={form.home_team}
+            onChange={(e) => setForm({ ...form, home_team: e.target.value })}
+            disabled={loading}
+          />
+          <input
+            placeholder="Away"
+            value={form.away_team}
+            onChange={(e) => setForm({ ...form, away_team: e.target.value })}
+            disabled={loading}
+          />
+          <input
+            placeholder="Score (e.g., 21-24)"
+            value={form.score}
+            onChange={(e) => setForm({ ...form, score: e.target.value })}
+            disabled={loading}
+          />
+          <input
+            placeholder="Quarter (Q1–Q4/OT)"
+            value={form.quarter}
+            onChange={(e) => setForm({ ...form, quarter: e.target.value })}
+            disabled={loading}
+          />
+          <input
+            placeholder="Clock (e.g., 0:42)"
+            value={form.clock}
+            onChange={(e) => setForm({ ...form, clock: e.target.value })}
+            disabled={loading}
+          />
+          <div style={{ display: "flex", gap: 8 }}>
+            <select
+              value={form.tone}
+              onChange={(e) => setForm({ ...form, tone: e.target.value })}
+              disabled={loading}
+            >
+              <option value="hype">hype</option>
+              <option value="neutral">neutral</option>
+              <option value="radio">radio</option>
+            </select>
+            {/* NEW: Bias selector */}
+            <select
+              value={form.bias}
+              onChange={(e) => setForm({ ...form, bias: e.target.value })}
+              disabled={loading}
+              title="Commentator POV bias"
+            >
+              <option value="neutral">bias: neutral</option>
+              <option value="home">bias: home</option>
+              <option value="away">bias: away</option>
+            </select>
+          </div>
         </div>
 
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -134,7 +173,9 @@ export default function Commentator() {
           <button onClick={onDemoMode} disabled={loading}>
             Demo Mode (prefilled backup)
           </button>
-          <button onClick={onReset} disabled={loading}>Reset</button>
+          <button onClick={onReset} disabled={loading}>
+            Reset
+          </button>
           {!canAnalyze && (
             <span style={{ marginLeft: 8, color: "#b45309", fontSize: 12 }}>
               Select a clip or enable “Audio only”.
@@ -155,25 +196,45 @@ export default function Commentator() {
               <div>
                 <h3>Audio</h3>
                 <audio controls src={staticUrl(resp.audio_url)} />
-                <div><a href={staticUrl(resp.audio_url)} download>Download audio</a></div>
+                <div>
+                  <a href={staticUrl(resp.audio_url)} download>
+                    Download audio
+                  </a>
+                </div>
               </div>
             )}
 
             {resp.video_url && (
               <div>
                 <h3>Dubbed Video</h3>
-                <video controls src={staticUrl(resp.video_url)} style={{ width: "100%", borderRadius: 8 }} />
-                <div><a href={staticUrl(resp.video_url)} download>Download video</a></div>
+                <video
+                  controls
+                  src={staticUrl(resp.video_url)}
+                  style={{ width: "100%", borderRadius: 8 }}
+                />
+                <div>
+                  <a href={staticUrl(resp.video_url)} download>
+                    Download video
+                  </a>
+                </div>
               </div>
             )}
 
             <small>
-              Latency: {resp.meta?.duration_s != null ? resp.meta.duration_s.toFixed?.(3) : "—"}s
+              Latency:{" "}
+              {resp.meta?.duration_s != null
+                ? resp.meta.duration_s.toFixed?.(3)
+                : "—"}
               {resp.meta?.usedManualContext ? " • manual context" : ""}
               {resp.meta?.audio_only ? " • audio-only" : ""}
               {resp.meta?.prompt_tone ? ` • tone: ${resp.meta.prompt_tone}` : ""}
+              {resp.meta?.prompt_bias ? ` • bias: ${resp.meta.prompt_bias}` : ""}
             </small>
-            {resp.meta?.errors && <pre style={{ color: "crimson" }}>{JSON.stringify(resp.meta.errors, null, 2)}</pre>}
+            {resp.meta?.errors && (
+              <pre style={{ color: "crimson" }}>
+                {JSON.stringify(resp.meta.errors, null, 2)}
+              </pre>
+            )}
           </div>
         )}
       </div>

@@ -43,15 +43,16 @@ def _wav_to_mp3(wav_path: Path) -> Path:
 
 @router.post("/analyze_commentate", response_model=AnalyzeOut)
 async def analyze_commentate(
-    file: UploadFile | None = File(default=None),       # <-- optional now
+    file: UploadFile | None = File(default=None),       # optional for audio-only runs
     home_team: str | None = Form(default=None),
     away_team: str | None = Form(default=None),
     score: str | None = Form(default=None),
     quarter: str | None = Form(default=None),
     clock: str | None = Form(default=None),
     tone: str = Form(default="play-by-play"),
+    bias: str = Form(default="neutral"),                # NEW: neutral | home | away
     voice: str = Form(default="default"),
-    audio_only: bool = Form(default=False),             # <-- new
+    audio_only: bool = Form(default=False),
 ):
     t0 = time.time()
     run_id = f"run_{uuid.uuid4().hex[:10]}"
@@ -79,13 +80,14 @@ async def analyze_commentate(
         "quarter": quarter,
         "clock": clock,
         "tone": tone,
+        "bias": bias,  # NEW: threaded through to the prompt builder
     }
 
-    # 2) Generate text via LLM (tone-aware)
+    # 2) Generate text via LLM (tone/bias-aware)
     try:
         llm = get_llm()
-        prompt = build_llm_prompt(context)
-        text = llm.generate(prompt, meta={"tone": normalize_tone(tone)})
+        prompt = build_llm_prompt(context)  # expects tone/bias in context
+        text = llm.generate(prompt, meta={"tone": normalize_tone(tone), "bias": (bias or "neutral").lower()})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
@@ -97,7 +99,8 @@ async def analyze_commentate(
     # 3) TTS (provider-based mp3)
     try:
         tts = get_tts()
-        audio_mp3_path = tts.synth_to_file(text, TTS_DIR, tone=tone)
+        # Pass tone/bias as optional kwargs; providers that don't use them will ignore safely
+        audio_mp3_path = tts.synth_to_file(text, TTS_DIR, tone=tone, bias=bias)  # type: ignore[call-arg]
         audio_mp3 = Path(audio_mp3_path)
     except Exception as e:
         errors.append(f"TTS error: {e}")
@@ -143,6 +146,7 @@ async def analyze_commentate(
             "duration_s": elapsed,
             "provider": {"llm": type(llm).__name__, "tts": tts_name},
             "prompt_tone": normalize_tone(tone),
+            "prompt_bias": (bias or "neutral").lower(),  # NEW: surfaced to UI
             "audio_only": audio_only,
             "errors": errors or None,
         },
