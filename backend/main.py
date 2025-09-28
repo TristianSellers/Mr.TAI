@@ -474,3 +474,6 @@ app.include_router(prewarm_router)
 
 from backend.routers.ocr_api import router as ocr_router
 app.include_router(ocr_router)
+
+from backend.routers.pipeline_api import router as pipeline_router
+app.include_router(pipeline_router)
