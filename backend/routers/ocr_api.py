@@ -32,7 +32,6 @@ MIME_TO_EXT = {
 def _safe_ext(upload: UploadFile, allow: Iterable[str]) -> str:
     ext = MIME_TO_EXT.get((upload.content_type or "").lower(), "")
     if not ext:
-        # sanitize filename
         name_only = Path(PurePath(upload.filename or "")).name
         ext = Path(name_only).suffix.lower()
     if not ext or ext not in allow:
@@ -90,9 +89,9 @@ class OCRVideoResponse(BaseModel):
     used_stub: bool
     sampled_from_s: float
 
-# ---------- Endpoints ----------
+# ---------- Endpoints (SYNC) ----------
 @router.post("/image", response_model=OCRImageResponse)
-async def ocr_image(
+def ocr_image(  # sync: FastAPI runs this in its threadpool
     image: UploadFile = File(...),
     debug: bool = Form(False),
     viz: bool = Form(False),
@@ -111,6 +110,7 @@ async def ocr_image(
         except Exception:
             pass
 
+        # CPU-bound OCR call (safe in sync endpoint)
         result = extract_scoreboard_from_image(
             str(dest),
             debug_crops=debug,
@@ -141,7 +141,7 @@ async def ocr_image(
                 pass
 
 @router.post("/video", response_model=OCRVideoResponse)
-async def ocr_video(
+def ocr_video(  # sync: FastAPI runs this in its threadpool
     video: UploadFile = File(...),
     viz: bool = Form(False),
     dx: int = Form(0),
@@ -151,6 +151,7 @@ async def ocr_video(
     dest = _safe_save_upload(video, VIDEO_EXTS)
     keep_uploads = os.getenv("KEEP_UPLOADS", "0") == "1"
     try:
+        # CPU-bound (ffmpeg/OpenCV + OCR)
         data = extract_scoreboard_from_video(
             str(dest),
             viz=viz,
