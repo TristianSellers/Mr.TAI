@@ -1,4 +1,3 @@
-# backend/routers/ocr_api.py
 from __future__ import annotations
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
@@ -31,41 +30,34 @@ MIME_TO_EXT = {
 }
 
 def _safe_ext(upload: UploadFile, allow: Iterable[str]) -> str:
-    # 1) Trust content-type → ext if known, else fall back to sanitized filename’s ext
     ext = MIME_TO_EXT.get((upload.content_type or "").lower(), "")
     if not ext:
-        # Drop any path components and weirdness
+        # sanitize filename
         name_only = Path(PurePath(upload.filename or "")).name
         ext = Path(name_only).suffix.lower()
-    if not ext:
-        raise HTTPException(status_code=400, detail="Missing or unsupported file extension.")
-    if ext not in allow:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+    if not ext or ext not in allow:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
     return ext
 
 def _safe_save_upload(upload: UploadFile, allow_exts: Iterable[str]) -> Path:
     """
     Save upload safely inside TMP_DIR:
-    - generates a UUID filename with validated/derived extension
+    - UUID filename with validated extension
     - exclusive create with 0600 perms
-    - verifies resolved path is within TMP_DIR
+    - confined to TMP_DIR
     """
     ext = _safe_ext(upload, allow_exts)
     uid = uuid.uuid4().hex
     dest = (TMP_DIR / f"{uid}{ext}").resolve()
 
-    # Ensure within TMP_DIR after resolution
     tmp_root = TMP_DIR.resolve()
     if not str(dest).startswith(str(tmp_root) + os.sep):
-        raise HTTPException(status_code=400, detail="Invalid upload destination.")
+        raise HTTPException(status_code=400, detail="Invalid upload destination")
 
-    # Exclusive create (no race) with 0o600 perms
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    # On Windows, os.O_BINARY may be needed, but on *nix this is fine.
     fd = os.open(str(dest), flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
-            # Stream copy
             shutil.copyfileobj(upload.file, f, length=1024 * 1024)
     finally:
         try:
@@ -107,8 +99,17 @@ async def ocr_image(
     dx: int = Form(0),
     dy: int = Form(0),
 ):
+    dest = _safe_save_upload(image, IMAGE_EXTS)
+    keep_uploads = os.getenv("KEEP_UPLOADS", "0") == "1"
     try:
-        dest = _safe_save_upload(image, IMAGE_EXTS)
+        # width/height before unlink
+        width = height = None
+        try:
+            from PIL import Image
+            with Image.open(dest) as im:
+                width, height = im.size
+        except Exception:
+            pass
 
         result = extract_scoreboard_from_image(
             str(dest),
@@ -119,30 +120,25 @@ async def ocr_image(
         )
         out = result.to_dict()
 
-        width = height = None
-        try:
-            from PIL import Image  # type: ignore
-            with Image.open(dest) as im:
-                width, height = im.size
-        except Exception:
-            pass
-
         return OCRImageResponse(
-            home_team = out.get("home_team"),
-            away_team = out.get("away_team"),
-            score     = out.get("score"),
-            quarter   = out.get("quarter"),
-            clock     = out.get("clock"),
-            ocr_text  = out.get("ocr_text"),
-            used_stub = bool(out.get("used_stub", False)),
-            width=width, height=height,
-            debug_dir = "data/tmp/ocr_debug" if debug else None,
-            boxes_png = "data/tmp/ocr_debug/boxes.png" if viz else None,
+            home_team=out.get("home_team"),
+            away_team=out.get("away_team"),
+            score=out.get("score"),
+            quarter=out.get("quarter"),
+            clock=out.get("clock"),
+            ocr_text=out.get("ocr_text"),
+            used_stub=bool(out.get("used_stub", False)),
+            width=width,
+            height=height,
+            debug_dir="data/tmp/ocr_debug" if debug else None,
+            boxes_png="data/tmp/ocr_debug/boxes.png" if viz else None,
         )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"OCR failed: {e}")
+    finally:
+        if not keep_uploads:
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 @router.post("/video", response_model=OCRVideoResponse)
 async def ocr_video(
@@ -152,9 +148,9 @@ async def ocr_video(
     dy: int = Form(0),
     t: float = Form(0.10),
 ):
+    dest = _safe_save_upload(video, VIDEO_EXTS)
+    keep_uploads = os.getenv("KEEP_UPLOADS", "0") == "1"
     try:
-        dest = _safe_save_upload(video, VIDEO_EXTS)
-
         data = extract_scoreboard_from_video(
             str(dest),
             viz=viz,
@@ -162,7 +158,6 @@ async def ocr_video(
             dy=dy,
             t=t,
         )
-
         return OCRVideoResponse(
             home_team=data.get("home_team"),
             away_team=data.get("away_team"),
@@ -173,7 +168,9 @@ async def ocr_video(
             used_stub=bool(data.get("used_stub", False)),
             sampled_from_s=float(t),
         )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"OCR(video) failed: {e}")
+    finally:
+        if not keep_uploads:
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
