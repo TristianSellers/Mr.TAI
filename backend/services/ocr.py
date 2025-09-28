@@ -44,7 +44,7 @@ class OCRScoreboard:
 REF_W, REF_H = 2047, 75
 REF_BOXES = {
     "away_team":  (550, 0, 650, 50),
-    "home_team":  (950, 0, 1100, 50),  # widened as you requested
+    "home_team":  (950, 0, 1100, 50),  # widened for safety
     "quarter":    (1350, 0, 1430, 50),
     "away_score": (700, 0, 775, 72),
     "home_score": (840, 0, 900, 72),
@@ -97,8 +97,6 @@ _Q_FROM_QDIGIT   = {"1":"1st","2":"2nd","3":"3rd","4":"4th"}
 _QUARTER_RX      = re.compile(r"\b(Q[1-4]|OT|1ST|2ND|3RD|4TH)\b", re.I)
 _QUARTER_WORD_RX = re.compile(r"\b([1-4])\s*(?:ST|ND|RD|TH)\b", re.I)
 _CLOCK_RX        = re.compile(r"\b([0-5]?\d:[0-5]\d)\b")
-
-# for fuzzy snap
 _ALLOWED_Q_TOKENS = ["1ST","2ND","3RD","4TH","OT","Q1","Q2","Q3","Q4","1st","2nd","3rd","4th","ot","q1","q2","q3","q4"]
 
 def _lev(a: str, b: str) -> int:
@@ -126,7 +124,6 @@ def _snap_quarter_token(s: str) -> Optional[str]:
         if d < best_d:
             best, best_d = tok, d
     if best is not None and best_d <= 2:
-        # normalize to lower-case "1st" style
         up = best.upper()
         if up in _QUARTER_MAP_IN: return _QUARTER_MAP_IN[up]
         if up.startswith("Q") and len(up) == 2 and up[1] in "1234":
@@ -136,9 +133,7 @@ def _snap_quarter_token(s: str) -> Optional[str]:
 def _norm_quarter(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
-    # normalize spacing/case and common fumbles
     s_up = re.sub(r"\s+", "", s.upper())
-    # Sometimes leading 1 becomes I/L; fix those before mapping
     if s_up.startswith(("I", "L")):
         s_up = "1" + s_up[1:]
     s_up = (s_up
@@ -155,7 +150,6 @@ def _norm_quarter(s: Optional[str]) -> Optional[str]:
     m2 = re.search(r"\b([1-4])\s*(?:ST|ND|RD|TH)\b", s, flags=re.I)
     if m2:
         return _Q_FROM_QDIGIT[m2.group(1)]
-    # final fuzzy snap
     snap = _snap_quarter_token(s)
     if snap:
         return snap
@@ -216,20 +210,34 @@ def _preprocess_banner(img: PILImageLike) -> PILImageLike:
         return img
 
 def _prep_digits_mask(img: PILImageLike, invert: bool = False) -> PILImageLike:
-    """White-ish text isolation; fallback to banner preprocess."""
+    """
+    White + yellow/amber text isolation -> clean binary -> upscale.
+    Falls back to banner preprocess if cv2 unavailable.
+    """
     try:
         import numpy as np, cv2  # type: ignore
         arr = np.array(img.convert("RGB"))
         hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-        lower = np.array([0, 0, 180], dtype=np.uint8)
-        upper = np.array([179, 40, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
+
+        # White-ish text on dark HUD
+        white_lo = np.array([0,   0, 180], dtype=np.uint8)
+        white_hi = np.array([179, 40, 255], dtype=np.uint8)
+        mask_white = cv2.inRange(hsv, white_lo, white_hi)
+
+        # Yellow/amber digits (common HUD tint)
+        yellow_lo = np.array([15,  60, 170], dtype=np.uint8)
+        yellow_hi = np.array([40, 255, 255], dtype=np.uint8)
+        mask_yellow = cv2.inRange(hsv, yellow_lo, yellow_hi)
+
+        mask = cv2.bitwise_or(mask_white, mask_yellow)
         if invert:
             mask = cv2.bitwise_not(mask)
+
         mask = cv2.GaussianBlur(mask, (3,3), 0)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         mask = cv2.resize(mask, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+
         from PIL import Image  # type: ignore
         return Image.fromarray(mask)
     except Exception:
@@ -243,12 +251,7 @@ def scale_box(box: Tuple[int,int,int,int], w: int, h: int,
     lx, ty, rx, by = box
     sx = w / ref_w
     sy = h / ref_h
-    return (
-        int(lx * sx + dx),
-        int(ty * sy + dy),
-        int(rx * sx + dx),
-        int(by * sy + dy),
-    )
+    return (int(lx * sx + dx), int(ty * sy + dy), int(rx * sx + dx), int(by * sy + dy))
 
 def crop_regions(img: PILImageLike, dx: int = 0, dy: int = 0) -> Dict[str, PILImageLike]:
     w, h = img.size
@@ -273,11 +276,12 @@ def draw_boxes(img: PILImageLike, out_path: Path, dx: int = 0, dy: int = 0) -> N
 # --------------------------- Tesseract wrappers ---------------------------
 
 def _ocr_digits_core(img: PILImageLike, whitelist: str) -> str:
+    # numeric mode biases to digits (reduces O/0/3 swaps)
     cfgs = [
-        f"--oem 1 --psm 10 -c tessedit_char_whitelist={whitelist}",
-        f"--oem 1 --psm 7  -c tessedit_char_whitelist={whitelist}",
-        f"--oem 1 --psm 6  -c tessedit_char_whitelist={whitelist}",
-        f"--oem 1 --psm 13 -c tessedit_char_whitelist={whitelist}",
+        f"--oem 1 --psm 10 -c tessedit_char_whitelist={whitelist} -c classify_bln_numeric_mode=1",
+        f"--oem 1 --psm 7  -c tessedit_char_whitelist={whitelist} -c classify_bln_numeric_mode=1",
+        f"--oem 1 --psm 6  -c tessedit_char_whitelist={whitelist} -c classify_bln_numeric_mode=1",
+        f"--oem 1 --psm 13 -c tessedit_char_whitelist={whitelist} -c classify_bln_numeric_mode=1",
     ]
     return _ocr_try_many(img, cfgs)
 
@@ -303,23 +307,18 @@ def _ocr_letters(img: PILImageLike) -> str:
 
 def _expand_box(box: Tuple[int,int,int,int], pad: int, max_w: int, max_h: int) -> Tuple[int,int,int,int]:
     lx, ty, rx, by = box
-    lx2 = max(0, lx - pad)
-    ty2 = max(0, ty - pad)
-    rx2 = min(max_w, rx + pad)
-    by2 = min(max_h, by + pad)
-    return (lx2, ty2, rx2, by2)
+    return (max(0, lx - pad), max(0, ty - pad), min(max_w, rx + pad), min(max_h, by + pad))
 
 def _recover_quarter_from_clock(base: PILImageLike, dx: int, dy: int) -> Optional[str]:
     """If quarter box fails, scan a wider strip left of the clock box and combine digits+suffix."""
     w, h = base.size
     c_lx, c_ty, c_rx, c_by = scale_box(REF_BOXES["clock"], w, h, dx=dx, dy=dy)
-    lx = max(0, c_lx - 220)  # wider sweep
+    lx = max(0, c_lx - 220)
     neighbor_box = (lx, c_ty, c_lx - 4, c_by)
     region = base.crop(_expand_box(neighbor_box, 6, w, h))
     q = _quarter_from_parts(region)
     if q:
         return q
-    # try raw OCR if parts failed
     for cfg in (
         "--oem 1 --psm 8 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
         "--oem 1 --psm 7 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
@@ -331,24 +330,122 @@ def _recover_quarter_from_clock(base: PILImageLike, dx: int, dy: int) -> Optiona
             return norm
     return None
 
+# -------- NEW: hole-shape detector for 0 vs 2/3 --------
+
+def _digit_has_hole(img: PILImageLike) -> Optional[bool]:
+    """
+    Returns True if the digit crop clearly contains an internal hole (0/6/8/9), False if not (2/3/5/7/1/4),
+    or None if we can't tell.
+    """
+    try:
+        import numpy as np, cv2  # type: ignore
+        bin_img = _prep_digits_mask(img, invert=False)
+        arr = np.array(bin_img)
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        # Ensure binary 0/255
+        _, bw = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # Find contours with hierarchy so we can count holes (child contours)
+        contours, hierarchy = cv2.findContours(bw, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            return False
+        holes = 0
+        for i, h in enumerate(hierarchy[0]):
+            parent_idx = h[3]
+            if parent_idx != -1:
+                holes += 1
+        return holes >= 1
+    except Exception:
+        return None
+
+# -------- robust score via micro-jitter voting + hole override --------
+
+def _read_score_microvote(base: PILImageLike, ref_key: str, dx: int, dy: int,
+                          debug_dir: Optional[Path]) -> Optional[str]:
+    """
+    Vote the score by sampling tiny jitters around the box.
+    Offsets: x in {-2,0,2}, y in {-1,0,1}; pads in {0,3}.
+    Applies a shape override: if OCR says {2,3} but the glyph has a hole -> count as 0.
+    """
+    w, h = base.size
+    box = scale_box(REF_BOXES[ref_key], w, h, dx=dx, dy=dy)
+    lx0, ty0, rx0, by0 = box
+
+    counts: Dict[int, int] = {}
+    def _bump(n: int, weight: int = 1): counts[n] = counts.get(n, 0) + weight
+
+    for pad in (0, 3):
+        for ox in (-2, 0, 2):
+            for oy in (-1, 0, 1):
+                lx = max(0, lx0 + ox); rx = min(w, rx0 + ox)
+                ty = max(0, ty0 + oy); by = min(h, by0 + oy)
+                crop = base.crop(_expand_box((lx,ty,rx,by), pad, w, h))
+
+                # OCR read (single/two-digit)
+                txt = _ocr_digits(crop)
+                norm = txt.replace("O","0").replace("o","0").replace("D","0").replace("Q","0")
+                m = re.search(r"\d{1,2}", norm)
+
+                # Shape hint: does it have a hole?
+                hole = _digit_has_hole(crop)
+
+                if m:
+                    val = int(m.group(0))
+                    # Only apply override for single-digit readings where 2/3 are common mistakes for 0
+                    if val in (2,3) and len(m.group(0)) == 1 and hole is True:
+                        _bump(0, weight=2)  # strong vote for 0 if hole exists
+                    else:
+                        _bump(val)
+                    continue
+
+                # If OCR failed but the shape says "has hole", it's very likely 0 in this HUD context
+                if hole is True:
+                    _bump(0)
+                    continue
+
+                # As a last resort, try preprocessed grayscale OCR
+                txt2 = _ocr_digits_core(_preprocess_banner(crop), "0123456789")
+                m2 = re.search(r"\d{1,2}", txt2.replace("O","0").replace("o","0").replace("D","0").replace("Q","0"))
+                if m2:
+                    _bump(int(m2.group(0)))
+
+    if counts:
+        maxc = max(counts.values())
+        # choose modal; break ties by smaller value (stable)
+        best_n = min([k for k, c in counts.items() if c == maxc])
+        return str(best_n)
+
+    return None
+
 def _extract_single_score(crop: PILImageLike, base: PILImageLike, ref_key: str, dx: int, dy: int,
                           debug_dir: Optional[Path]) -> Optional[str]:
-    """Robustly read one score box; returns '0'..'99' or None."""
+    """Backup path if micro-vote yields nothing. Applies the same hole override."""
     def _norm_digits(s: Optional[str]) -> Optional[str]:
         if not s: return None
-        s = s.replace("O", "0").replace("o", "0").replace("D", "0").replace("Q", "0")
-        return s
+        return s.replace("O", "0").replace("o", "0").replace("D", "0").replace("Q", "0")
 
+    # OCR
     txt = _ocr_digits(crop)
-    nums = re.findall(r"\d{1,2}", _norm_digits(txt) or "")
-    if nums:
-        return nums[0]
+    m = re.search(r"\d{1,2}", _norm_digits(txt) or "")
+    hole = _digit_has_hole(crop)
 
+    if m:
+        val = int(m.group(0))
+        if val in (2,3) and len(m.group(0)) == 1 and hole is True:
+            return "0"
+        return str(int(m.group(0)))
+
+    # Preprocessed OCR
     txt2 = _ocr_digits_core(_preprocess_banner(crop), "0123456789")
-    nums = re.findall(r"\d{1,2}", _norm_digits(txt2) or "")
-    if nums:
-        return nums[0]
+    m = re.search(r"\d{1,2}", _norm_digits(txt2) or "")
+    if m:
+        val = int(m.group(0))
+        if val in (2,3) and len(m.group(0)) == 1 and hole is True:
+            return "0"
+        return str(int(m.group(0)))
 
+    # Expand box + retry
     w, h = base.size
     box = scale_box(REF_BOXES[ref_key], w, h, dx=dx, dy=dy)
     exp_box = _expand_box(box, 6, w, h)
@@ -359,52 +456,52 @@ def _extract_single_score(crop: PILImageLike, base: PILImageLike, ref_key: str, 
         except Exception:
             pass
     txt3 = _ocr_digits(exp_crop)
-    nums = re.findall(r"\d{1,2}", _norm_digits(txt3) or "")
-    if nums:
-        return nums[0]
+    m = re.search(r"\d{1,2}", _norm_digits(txt3) or "")
+    hole2 = _digit_has_hole(exp_crop)
+    if m:
+        val = int(m.group(0))
+        if val in (2,3) and len(m.group(0)) == 1 and (hole2 is True or hole is True):
+            return "0"
+        return str(int(m.group(0)))
 
+    # Last resort: single-char forced read
     txt4 = _ocr_digits_core(_prep_digits_mask(exp_crop, invert=False), "0123456789")
-    nums = re.findall(r"\d", _norm_digits(txt4) or "")
-    if nums:
-        return nums[0]
+    m = re.search(r"\d", _norm_digits(txt4) or "")
+    if m:
+        val = int(m.group(0))
+        hole3 = _digit_has_hole(exp_crop)
+        if val in (2,3) and hole3 is True:
+            return "0"
+        return str(int(m.group(0)))
 
     return None
 
 def _quarter_from_parts(region: PILImageLike) -> Optional[str]:
     """Combine digits-only + suffix-only OCR to form 1st/2nd/3rd/4th."""
-    # digits
     d_txt = _ocr_digits(region)
     digit = None
     m = re.search(r"[1-4]", d_txt or "")
     if not m:
-        # common misreads I/l -> 1
         m = re.search(r"[IlL]", d_txt or "")
         if m:
             digit = "1"
     else:
         digit = m.group(0)
-
-    # suffix
     s_txt = _ocr_text(region, "--oem 1 --psm 7 -c tessedit_char_whitelist=STNDRDTHstndrdth")
     suf = None
     ms = re.search(r"(ST|ND|RD|TH)", (s_txt or "").upper())
     if ms:
         suf = ms.group(1)
-
     if digit and suf:
         return _norm_quarter(f"{digit}{suf}")
-    # If digit alone, interpret as Qx
     if digit:
         return _norm_quarter(f"Q{digit}")
-    # Try fuzzy snap on whatever we saw
     snap = _snap_quarter_token((d_txt or "") + " " + (s_txt or ""))
     if snap:
         return snap
     return None
 
 def _ocr_quarter(q_crop: PILImageLike, base: PILImageLike, dx: int, dy: int) -> Optional[str]:
-    """Try several strategies to read quarter: direct, masked, expanded, neighbor-left-of-clock, digits+suffix."""
-    # A. direct on the quarter crop (multiple configs)
     for cfg in (
         "--oem 1 --psm 8 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
         "--oem 1 --psm 7 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
@@ -415,12 +512,9 @@ def _ocr_quarter(q_crop: PILImageLike, base: PILImageLike, dx: int, dy: int) -> 
         norm = _norm_quarter(q_raw)
         if norm:
             return norm
-        # fuzzy
         snap = _snap_quarter_token(q_raw)
         if snap:
             return snap
-
-    # B. masked (normal + inverted)
     for masked in (_prep_digits_mask(q_crop, invert=False), _prep_digits_mask(q_crop, invert=True)):
         for cfg in (
             "--oem 1 --psm 8 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
@@ -434,13 +528,9 @@ def _ocr_quarter(q_crop: PILImageLike, base: PILImageLike, dx: int, dy: int) -> 
             snap = _snap_quarter_token(q_raw)
             if snap:
                 return snap
-
-    # C. combine digits + suffix on the quarter crop itself
     comb = _quarter_from_parts(q_crop)
     if comb:
         return comb
-
-    # D. expand the quarter box
     w, h = base.size
     q_box = scale_box(REF_BOXES["quarter"], w, h, dx=dx, dy=dy)
     q_box = _expand_box(q_box, 12, w, h)
@@ -448,10 +538,8 @@ def _ocr_quarter(q_crop: PILImageLike, base: PILImageLike, dx: int, dy: int) -> 
     comb2 = _quarter_from_parts(q_exp)
     if comb2:
         return comb2
-    for cfg in (
-        "--oem 1 --psm 8 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
-        "--oem 1 --psm 7 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
-    ):
+    for cfg in ("--oem 1 --psm 8 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh",
+                "--oem 1 --psm 7 -c tessedit_char_whitelist=Qq01234OoTtSsNnDdRrTtHh"):
         q_raw = _ocr_text(q_exp, cfg)
         norm = _norm_quarter(q_raw)
         if norm:
@@ -459,9 +547,21 @@ def _ocr_quarter(q_crop: PILImageLike, base: PILImageLike, dx: int, dy: int) -> 
         snap = _snap_quarter_token(q_raw)
         if snap:
             return snap
-
-    # E. neighbor-left-of-clock
     return _recover_quarter_from_clock(base, dx, dy)
+
+def _choose_home_by_seen_tokens(away: Optional[str], home: Optional[str], seen: Set[str]) -> Optional[str]:
+    """
+    If the global OCR across the strip ('seen') contains exactly two team tokens
+    and one of them is the away team, pick the other as home.
+    """
+    if not away or not seen:
+        return home
+    teams = {t for t in seen if t in TEAM_ABBREVS}
+    if away in teams and len(teams) == 2:
+        other = (teams - {away})
+        if len(other) == 1:
+            return next(iter(other))
+    return home
 
 # --------------------------- Core extraction ---------------------------
 
@@ -486,16 +586,17 @@ def _extract_from_crops(
     home_raw = _clean_team(_first_abbrev(_ocr_letters(crops["home_team"])))
     away = _nearest_team_abbrev(away_raw, prefer=prefer_tokens)
     home = _nearest_team_abbrev(home_raw, prefer=prefer_tokens)
+    home = _choose_home_by_seen_tokens(away, home, prefer_tokens or set())
 
-    # Scores (explicit away-home)
-    away_num = _extract_single_score(crops["away_score"], base, "away_score", dx, dy, debug_dir)
-    home_num = _extract_single_score(crops["home_score"], base, "home_score", dx, dy, debug_dir)
+    # Scores (explicit away-home) with micro-vote + hole override
+    away_num = _read_score_microvote(base, "away_score", dx, dy, debug_dir) \
+               or _extract_single_score(crops["away_score"], base, "away_score", dx, dy, debug_dir)
+    home_num = _read_score_microvote(base, "home_score", dx, dy, debug_dir) \
+               or _extract_single_score(crops["home_score"], base, "home_score", dx, dy, debug_dir)
     score = f"{away_num}-{home_num}" if (away_num is not None and home_num is not None) else None
 
-    # Quarter
+    # Quarter & clock
     quarter = _ocr_quarter(crops["quarter"], base, dx, dy)
-
-    # Clock
     clock = _best_token(_ocr_digits(crops["clock"], allow_colon=True), _CLOCK_RX)
 
     return {"home": home, "away": away, "score": score, "clock": clock, "quarter": quarter}
@@ -530,7 +631,6 @@ def extract_scoreboard_from_image(
 
             base = _preprocess_banner(im)
 
-            # General pass to bias team snapping and possible global fill-ins
             general = _ocr_text(
                 base,
                 "--oem 1 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789: "
@@ -542,20 +642,18 @@ def extract_scoreboard_from_image(
 
             fields = _extract_from_crops(crops, base, dx, dy, debug_dir=dbg_dir, prefer_tokens=prefer_tokens)
 
-            # Fill-ins if missing (keeps away-home order for score)
             if not all([fields["home"], fields["away"], fields["score"], fields["quarter"], fields["clock"]]):
                 fields["quarter"] = fields["quarter"] or _norm_quarter(
                     _best_token(general, _QUARTER_RX) or _best_token(general, _QUARTER_WORD_RX)
                 ) or _snap_quarter_token(general)
                 fields["clock"] = fields["clock"] or _best_token(general, _CLOCK_RX)
 
-                # If score still missing, try to reconstruct from two numbers found globally (as last resort)
                 if not fields["score"]:
                     nums = re.findall(r"\d{1,2}", general.replace("O","0").replace("o","0"))
                     if len(nums) >= 2:
-                        fields["score"] = f"{nums[0]}-{nums[1]}"
+                        a = str(int(nums[0])); b = str(int(nums[1]))
+                        fields["score"] = f"{a}-{b}"
 
-                # Team fixes using preference tokens
                 if prefer_tokens:
                     if fields["home"] and fields["home"] not in prefer_tokens:
                         cands = [t for t in prefer_tokens if t != fields.get("away")]
@@ -566,9 +664,9 @@ def extract_scoreboard_from_image(
                         if len(cands) == 1:
                             fields["away"] = cands[0]
 
-            # Final snap
             fields["away"] = _nearest_team_abbrev(fields.get("away"), prefer=prefer_tokens)
             fields["home"] = _nearest_team_abbrev(fields.get("home"), prefer=prefer_tokens)
+            fields["home"] = _choose_home_by_seen_tokens(fields["away"], fields["home"], prefer_tokens or set())
 
             return OCRScoreboard(
                 home_team=fields["home"],
