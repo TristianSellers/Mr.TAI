@@ -50,6 +50,7 @@ export async function runOcrVideo(file, { viz = false, dx = 0, dy = 0, t = 0.1 }
 }
 
 // ---- One-shot pipeline (recommended) ----
+// Upload *only* a video; backend does OCR → LLM → TTS → (optional) mux.
 export async function runCommentaryFromVideo(
   file,
   {
