@@ -36,7 +36,7 @@ class OCRScoreboard:
     ocr_text:  Optional[str] = None
     used_stub: bool = False
 
-    def to_dict(self) -> Dict[str, Optional[str]]:
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 # --------------------------- Reference layout (pixels) ---------------------------
