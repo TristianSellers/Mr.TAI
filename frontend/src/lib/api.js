@@ -6,10 +6,9 @@ const RAW_API_BASE = import.meta?.env?.VITE_API_BASE ?? "http://localhost:8000";
 export const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
 
 // ---- Utilities ----
-function toUrl(path) {
-  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
-}
+export const staticUrl = (u) => (u ? `${API_BASE}${u}` : "");
 
+// Basic JSON fetch wrapper
 async function httpJson(url, init = {}) {
   const res = await fetch(url, init);
   if (!res.ok) {
@@ -21,52 +20,49 @@ async function httpJson(url, init = {}) {
 
 // ---- Health ----
 export async function getHealth() {
-  return httpJson(toUrl("/health"));
+  return httpJson(`${API_BASE}/health`);
 }
 
-// ---- OCR (optional helpers for debugging/manual use) ----
-export async function runOcrImage(file, { viz = false, debug = false, dx = 0, dy = 0 } = {}) {
+// ---- Upload (optional legacy helper) ----
+export async function uploadFile(file) {
   const fd = new FormData();
-  fd.append("image", file);
-  fd.append("viz", String(viz));
-  fd.append("debug", String(debug));
-  fd.append("dx", String(dx));
-  fd.append("dy", String(dy));
-  return httpJson(toUrl("/ocr/image"), { method: "POST", body: fd });
+  fd.append("file", file);
+  return httpJson(`${API_BASE}/upload`, { method: "POST", body: fd });
 }
 
-export async function runOcrVideo(file, { viz = false, dx = 0, dy = 0, t = 0.1 } = {}) {
-  const fd = new FormData();
-  fd.append("video", file);
-  fd.append("viz", String(viz));
-  fd.append("dx", String(dx));
-  fd.append("dy", String(dy));
-  fd.append("t", String(t));
-  return httpJson(toUrl("/ocr/video"), { method: "POST", body: fd });
-}
-
-// ---- One-shot pipeline (recommended) ----
-// Upload *only* a video; backend does OCR → LLM → TTS → (optional) mux.
-export async function runCommentaryFromVideo(
-  file,
-  { tone = "play-by-play", bias = "neutral", audioOnly = false, viz = false, dx = 0, dy = 0, t = 0.1 } = {}
-) {
+// ---- One-shot pipeline (video → OCR → LLM → TTS → mux) ----
+export async function runCommentaryFromVideo({ file, tone = "neutral", bias = "neutral", gender = "male" }) {
+  if (!file) throw new Error("Video file is required");
   const fd = new FormData();
   fd.append("video", file);
   fd.append("tone", tone);
   fd.append("bias", bias);
-  fd.append("audio_only", String(audioOnly));
-  // passthrough diagnostic knobs (unused is fine)
-  fd.append("viz", String(viz));
-  fd.append("dx", String(dx));
-  fd.append("dy", String(dy));
-  fd.append("t", String(t));
-  return httpJson(toUrl("/pipeline/run-commentary-from-video"), { method: "POST", body: fd });
+  fd.append("gender", gender);
+  return httpJson(`${API_BASE}/pipeline/run-commentary-from-video`, { method: "POST", body: fd });
+}
+
+// ---- Voice preview / options ----
+export async function getVoiceOptions({ tone = "neutral", gender } = {}) {
+  const u = new URL(`${API_BASE}/pipeline/voice-options`);
+  if (tone) u.searchParams.set("tone", tone);
+  if (gender) u.searchParams.set("gender", gender);
+  const res = await fetch(u);
+  if (!res.ok) throw new Error(`voice-options failed: ${res.status}`);
+  return res.json(); // { voices:[{id,name,gender,emotions,suggested_emotion}], tone, gender }
+}
+
+export async function previewVoice({ tone = "neutral", bias = "neutral", gender = "male", text = "Mic check. One-two.", voiceId, emotion } = {}) {
+  const fd = new FormData();
+  fd.append("tone", tone);
+  fd.append("bias", bias);
+  fd.append("gender", gender);
+  fd.append("text", text);
+  if (voiceId) fd.append("voice_id", voiceId);
+  if (emotion) fd.append("emotion_preset", emotion);
+  return httpJson(`${API_BASE}/pipeline/voice-preview`, { method: "POST", body: fd });
 }
 
 // ---- Legacy: direct analyze endpoint (kept for compatibility) ----
-// If other pages still call /analyze_commentate, this keeps them working.
-// Prefer runCommentaryFromVideo for the new flow.
 export async function analyzeCommentate(
   file,
   {
@@ -92,20 +88,16 @@ export async function analyzeCommentate(
   fd.append("bias", bias);
   fd.append("voice", voice);
   fd.append("audio_only", String(audio_only));
-  return httpJson(toUrl("/analyze_commentate"), { method: "POST", body: fd });
-}
-
-// ---- Helpers for building absolute static URLs in the UI ----
-export function staticUrl(pathOrNull) {
-  return pathOrNull ? toUrl(pathOrNull) : "";
+  return httpJson(`${API_BASE}/analyze_commentate`, { method: "POST", body: fd });
 }
 
 export default {
   API_BASE,
-  getHealth,
-  runOcrImage,
-  runOcrVideo,
-  runCommentaryFromVideo,
-  analyzeCommentate,
   staticUrl,
+  getHealth,
+  uploadFile,
+  runCommentaryFromVideo,
+  getVoiceOptions,
+  previewVoice,
+  analyzeCommentate,
 };

@@ -105,9 +105,118 @@ class OpenAITTS:
             return str(out)
 
 
+# -------- Typecast --------
+class TypecastTTS:
+    """
+    Minimal provider that matches your TTSClient protocol (synth_to_file).
+    Supports 'tone' kwarg mapped to Typecast emotion presets and allows
+    per-call voice override via 'voice_id' kwarg.
+
+    Env:
+      TYPECAST_API_KEY    (required)
+      TYPECAST_VOICE_ID   (default voice; can be overridden per call)
+      TYPECAST_MODEL      (default: 'ssfm-v21')
+      TYPECAST_AUDIO_FORMAT (default: 'mp3')  # 'mp3' or 'wav'
+    """
+    # Map your app's tones -> Typecast emotion presets
+    # (Tweak as you like; safe defaults)
+    TONE_TO_EMOTION = {
+        "play-by-play": "toneup",  # energetic / excited
+        "hype":         "toneup",
+        "radio":        "tonemid", # smoother/announcer
+        "neutral":      "normal",
+        "serious":      "normal",
+        "sad":          "sad",
+        "angry":        "angry",
+        "happy":        "happy",
+    }
+
+    def __init__(self):
+        self.key = (os.getenv("TYPECAST_API_KEY") or "").strip()
+        if not self.key:
+            raise RuntimeError("TYPECAST_API_KEY missing")
+        self.voice_id = (os.getenv("TYPECAST_VOICE_ID") or "").strip()
+        self.model = (os.getenv("TYPECAST_MODEL", "ssfm-v21") or "").strip()
+        self.audio_format = (os.getenv("TYPECAST_AUDIO_FORMAT", "mp3") or "mp3").strip().lower()
+        if self.audio_format not in ("mp3", "wav"):
+            self.audio_format = "mp3"
+
+    def synth_to_file(self, text: str, out_dir: str | pathlib.Path, **kwargs) -> str:
+        """
+        kwargs:
+          - tone: string (maps to Typecast emotion preset)
+          - bias: accepted but unused
+          - voice_id: override env default
+          - emotion_preset: pass-through to force a specific preset
+          - emotion_intensity: float (0.0..2.0), default 1.0
+          - volume: int (0..200), default 100
+          - audio_pitch: int (-12..+12), default 0
+          - audio_tempo: float (0.5..2.0), default 1.0
+          - language: string (e.g., 'eng'), default 'eng'
+          - seed: int, optional
+          - model: override the model if needed
+          - audio_format: 'mp3'|'wav' (overrides env)
+        """
+        out_dir = pathlib.Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        tone = (kwargs.get("tone") or "neutral").lower()
+        emotion_preset = kwargs.get("emotion_preset") or self.TONE_TO_EMOTION.get(tone, "normal")
+        emotion_intensity = float(kwargs.get("emotion_intensity", 1.0))
+
+        payload_model = (kwargs.get("model") or self.model)
+        voice_id = (kwargs.get("voice_id") or self.voice_id).strip()
+        if not voice_id:
+            raise RuntimeError("Typecast voice_id required (set TYPECAST_VOICE_ID or pass voice_id=...)")
+
+        language = kwargs.get("language", "eng")
+        volume = int(kwargs.get("volume", 100))
+        audio_pitch = int(kwargs.get("audio_pitch", 0))
+        audio_tempo = float(kwargs.get("audio_tempo", 1.0))
+        seed = kwargs.get("seed")
+        fmt = (kwargs.get("audio_format") or self.audio_format).lower()
+        if fmt not in ("mp3", "wav"):
+            fmt = "mp3"
+
+        url = "https://api.typecast.ai/v1/text-to-speech"
+        headers = {
+            "X-API-KEY": self.key,
+            "Content-Type": "application/json",
+            "Accept": "*/*",  # audio bytes
+        }
+        body = {
+            "voice_id": voice_id,
+            "text": text,
+            "model": payload_model,
+            "language": language,
+            "prompt": {
+                "emotion_preset": emotion_preset,
+                "emotion_intensity": emotion_intensity,
+            },
+            "output": {
+                "volume": volume,
+                "audio_pitch": audio_pitch,
+                "audio_tempo": audio_tempo,
+                "audio_format": fmt,
+            },
+        }
+        if seed is not None:
+            body["seed"] = int(seed)
+
+        r = requests.post(url, json=body, headers=headers, timeout=120)
+        if r.status_code != 200:
+            snippet = r.text[:200].replace(self.key, "***")
+            raise RuntimeError(f"Typecast {r.status_code}: {snippet}")
+
+        out_path = out_dir / f"tts_{uuid.uuid4().hex}.{fmt}"
+        out_path.write_bytes(r.content)
+        return str(out_path)
+
 @lru_cache(maxsize=1)
 def get_tts():
     provider = (os.getenv("TTS_PROVIDER", "elevenlabs") or "").lower()
     if provider == "openai":
         return OpenAITTS()
+    if provider == "typecast":
+        return TypecastTTS()
     return ElevenLabsTTS()
