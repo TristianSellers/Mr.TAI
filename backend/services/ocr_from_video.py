@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Tuple, List, Dict, Optional
 import subprocess, shlex, json, re
+from collections import Counter
 
-from .ocr import extract_scoreboard_from_image, draw_boxes
+from .ocr import extract_scoreboard_from_image, draw_boxes  # legacy extractor (fallback)
 
 # Optional OpenCV for grabbing frames
 try:
@@ -14,24 +15,81 @@ except Exception:
 
 # Pillow for cropping & drawing
 try:
-    from PIL import Image, ImageDraw  # type: ignore
+    from PIL import Image, ImageDraw, ImageOps  # type: ignore
 except Exception as e:
     raise RuntimeError("Pillow is required. pip install Pillow") from e
 
+# Pillow resample constant (compat across Pillow versions)
+try:
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST   # Pillow ≥ 9.1
+except Exception:
+    RESAMPLE_NEAREST = 0                          # older Pillow integer code
+
+# Optional pytesseract for fast path
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None
+
 # ----- Reference full-frame -> scoreboard crop -----
-# Reference full-frame: 2047x1155, scoreboard y=[1080,1155)
 REF_FRAME_W, REF_FRAME_H = 2047, 1155
 SCOREBAR_BOX = (0, 1080, 2047, 1155)  # (left, top, right, bottom) in reference space
 
-def grab_frame_at_time(video_path: str, ts: float, out_path: str) -> Path:
-    """
-    Save a PNG for the frame at timestamp 'ts' (seconds).
-    Tries OpenCV first; falls back to ffmpeg -ss.
-    """
-    src = Path(video_path)
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+# ----- EXACT pixel ROIs on the scoreboard crop (x0, y0, x1, y1) -----
+SB_ROIS_PX: Dict[str, Tuple[int, int, int, int]] = {
+    "away_team":  (500,  0, 600, 50),
+    "home_team":  (900,  0, 1000,50),
+    "away_score": (655,  0, 745, 72),
+    "home_score": (765,  0, 855, 72),
+    "quarter":    (1285, 20,1340,50),
+    "clock":      (1325, 20,1445,50),
+}
 
+# ----- regex/validators -----
+_SCORE_RX   = re.compile(r"^\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\s*$")
+_CLOCK_RX   = re.compile(r"^\s*(\d{1,2}):([0-5]\d)\s*$")
+_QTR_RX_MDN = re.compile(r"^(1ST|2ND|3RD|4TH|OT)$", re.I)
+_QTR_RX_QN  = re.compile(r"^(Q[1-4]|OT)$", re.I)
+
+def _normalize_quarter(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    s = s.strip().upper().replace(" ", "")
+    s = s.replace("0T", "OT").replace("QI", "Q1").replace("QT", "Q1")
+    m = _QTR_RX_MDN.match(s)
+    if m:
+        return {"1ST":"Q1","2ND":"Q2","3RD":"Q3","4TH":"Q4","OT":"OT"}[m.group(1)]
+    m2 = _QTR_RX_QN.match(s)
+    if m2:
+        return m2.group(1).upper()
+    if re.fullmatch(r"[1-4]", s):
+        return f"Q{s}"
+    return None
+
+def _mode_int(counts: Dict[int,int]) -> Optional[int]:
+    if not counts: return None
+    maxc = max(counts.values())
+    winners = [k for k, c in counts.items() if c == maxc]
+    return min(winners)
+
+def _mode_val(values: List[str]) -> Optional[str]:
+    vs = [v for v in values if v]
+    return Counter(vs).most_common(1)[0][0] if vs else None
+
+def _to_int_or_none(val: object) -> Optional[int]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not re.fullmatch(r"\d{1,2}", s):
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+# ----- frame grabbing -----
+def grab_frame_at_time(video_path: str, ts: float, out_path: str) -> Path:
+    src = Path(video_path); out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
     if cv2 is not None:
         cap = cv2.VideoCapture(str(src))
         if cap.isOpened():
@@ -42,169 +100,408 @@ def grab_frame_at_time(video_path: str, ts: float, out_path: str) -> Path:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 Image.fromarray(frame_rgb).save(out)
                 return out
-
     cmd = f'ffmpeg -y -v error -ss {ts:.3f} -i {shlex.quote(str(src))} -frames:v 1 {shlex.quote(str(out))}'
     subprocess.run(cmd, shell=True, check=False)
     if out.exists():
         return out
-
     raise RuntimeError(f"Could not grab frame at t={ts:.3f}s. Install opencv-python or ffmpeg.")
 
 def _scale_box_to_frame(box: Tuple[int,int,int,int], w: int, h: int) -> Tuple[int,int,int,int]:
     lx, ty, rx, by = box
-    sx = w / REF_FRAME_W
-    sy = h / REF_FRAME_H
+    sx = w / REF_FRAME_W; sy = h / REF_FRAME_H
     return (int(lx * sx), int(ty * sy), int(rx * sx), int(by * sy))
 
 def crop_scorebar_from_frame(frame_path: str, out_path: str, box: Tuple[int,int,int,int] = SCOREBAR_BOX) -> Path:
-    """Crop the scoreboard bar from a full frame; auto-scales box if frame != 2047x1155."""
-    ip = Path(frame_path)
-    op = Path(out_path)
+    ip = Path(frame_path); op = Path(out_path)
     op.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(ip) as im:
         w, h = im.size
-        if (w, h) != (REF_FRAME_W, REF_FRAME_H):
-            lx, ty, rx, by = _scale_box_to_frame(box, w, h)
-        else:
-            lx, ty, rx, by = box
-        crop = im.crop((lx, ty, rx, by))
-        crop.save(op)
+        lx, ty, rx, by = _scale_box_to_frame(box, w, h) if (w, h) != (REF_FRAME_W, REF_FRAME_H) else box
+        im.crop((lx, ty, rx, by)).save(op)
         return op
 
 def draw_frame_crop_outline(frame_path: str, out_path: str = "data/tmp/frame_with_scorebar_box.png") -> Path:
-    """Draw a green rectangle showing where SCOREBAR_BOX maps on the full frame."""
-    ip = Path(frame_path)
-    op = Path(out_path)
+    ip = Path(frame_path); op = Path(out_path)
     op.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(ip) as im:
         w, h = im.size
         lx, ty, rx, by = _scale_box_to_frame(SCOREBAR_BOX, w, h)
-        vis = im.copy()
-        d = ImageDraw.Draw(vis)
+        vis = im.copy(); d = ImageDraw.Draw(vis)
         d.rectangle((lx, ty, rx, by), outline="lime", width=3)
         vis.save(op)
     return op
 
-# -------- voting helpers --------
+# ----- per-call ref-size + ROI helpers -----
+class _RefSize:
+    __slots__ = ("w","h")
+    def __init__(self) -> None:
+        self.w: Optional[int] = None
+        self.h: Optional[int] = None
 
-_SCORE_RX = re.compile(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$")
+def _prep_gray_bw(pil: Image.Image, thresh: int = 160, invert: bool = False) -> Image.Image:
+    g = pil.convert("L")
+    table = [0] * (thresh + 1) + [255] * (256 - (thresh + 1))
+    bw = g.point(table, mode="L")
+    return ImageOps.invert(bw) if invert else bw
 
-def _parse_score_tuple(s: Optional[str]) -> Optional[Tuple[int,int]]:
-    if not s: return None
-    m = _SCORE_RX.match(s)
-    if not m: return None
+def _crop_px_from_ref(sb_img: Image.Image, box_px: Tuple[int,int,int,int], ref: _RefSize) -> Image.Image:
+    """Use a per-call reference size (no globals) for scaling pixel ROIs."""
+    w, h = sb_img.size
+    if ref.w is None or ref.h is None:
+        ref.w, ref.h = w, h
+    sx = w / float(ref.w); sy = h / float(ref.h)
+    x0, y0, x1, y1 = box_px
+    X0, Y0 = max(0, int(round(x0 * sx))), max(0, int(round(y0 * sy)))
+    X1, Y1 = min(w, int(round(x1 * sx))),  min(h, int(round(y1 * sy)))
+    return sb_img.crop((X0, Y0, X1, Y1))
+
+def _autotrim_to_content(pil: Image.Image, bg_is_white: bool = True) -> Image.Image:
+    bw = _prep_gray_bw(pil, thresh=165, invert=bg_is_white)  # invert=True => text dark on white
+    inv = ImageOps.invert(bw)
+    box = inv.getbbox()
+    if box:
+        return pil.crop(box)
+    return pil
+
+# ---- OCR drivers (with guarded tesseract calls) ----
+def _tess(pil: Image.Image, allow: str, psm: int) -> str:
+    if pytesseract is None:
+        return ""
+    cfg = f'--psm {psm} -c tessedit_char_whitelist={allow}'
     try:
-        return (int(m.group(1)), int(m.group(2)))
+        return (pytesseract.image_to_string(pil, config=cfg) or "").strip()
     except Exception:
+        # Tesseract missing/misconfigured: degrade gracefully
+        return ""
+
+def _single_read_alnum_fast(pil: Image.Image, allow: str) -> str:
+    bw = _prep_gray_bw(pil, thresh=160, invert=False)
+    s = _tess(bw, allow, psm=7)
+    return (s or "").strip()
+
+def _ocr_letters_fast(pil: Image.Image) -> str:
+    s = _single_read_alnum_fast(pil, allow="ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    return re.sub(r"[^A-Z]", "", s.upper()).strip()
+
+def _ocr_clock_fast(pil: Image.Image) -> Optional[str]:
+    s = _single_read_alnum_fast(pil, allow="0123456789:")
+    m = _CLOCK_RX.match(s)
+    return f"{int(m.group(1))}:{m.group(2)}" if m else None
+
+# ---- donut heuristic for 0 ----
+def _center_white_ratio(img: Image.Image) -> float:
+    hist = img.histogram()
+    total = sum(hist); white = hist[255] if len(hist) >= 256 else 0
+    return (white / total) if total else 0.0
+
+def _looks_like_zero(pil: Image.Image) -> bool:
+    im = pil.resize((max(1, pil.width*3), max(1, pil.height*3)), resample=RESAMPLE_NEAREST)
+    for invert in (False, True):
+        bw = _prep_gray_bw(im, thresh=170, invert=invert)
+        W, H = bw.size
+        cx0, cy0 = int(W*0.30), int(H*0.30)
+        cx1, cy1 = int(W*0.70), int(H*0.70)
+        center = bw.crop((cx0, cy0, cx1, cy1))
+        ring   = bw.crop((int(W*0.15), int(H*0.15), int(W*0.85), int(H*0.85)))
+        if (_center_white_ratio(center) - _center_white_ratio(ring)) > 0.08:
+            return True
+    return False
+
+def _read_digit_strict(pil: Image.Image) -> Optional[str]:
+    if pytesseract is None:
         return None
+    base = _autotrim_to_content(pil, bg_is_white=True)
+    votes: List[str] = []
+    for scale in (2, 3):
+        im = base.resize((max(1, base.width*scale), max(1, base.height*scale)), resample=RESAMPLE_NEAREST)
+        for thresh in (145, 160, 170, 185):
+            for inv in (False, True):
+                bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
+                for psm in (10, 13):  # single char
+                    s = _tess(bw, "0123456789", psm)
+                    s = re.sub(r"[^0-9]", "", s)
+                    if len(s) == 1:
+                        votes.append(s)
+    if votes:
+        pick, _ = Counter(votes).most_common(1)[0]
+        if pick in {"7", "2"} and _looks_like_zero(base):
+            return "0"
+        return pick
+    im2 = base.resize((max(1, base.width*3), max(1, base.height*3)), resample=RESAMPLE_NEAREST)
+    s2 = _tess(_prep_gray_bw(im2, thresh=165, invert=False), "O0123456789", psm=10)
+    s2 = re.sub(r"[^0-9O]", "", s2).replace("O", "0")
+    if len(s2) == 1:
+        if s2 in {"7", "2"} and _looks_like_zero(base):
+            return "0"
+        return s2
+    return None
 
-def _mode_int(counts: Dict[int,int]) -> Optional[int]:
-    if not counts: return None
-    maxc = max(counts.values())
-    # choose the smallest value among ties (stable)
-    winners = [k for k, c in counts.items() if c == maxc]
-    return min(winners)
+def _read_score_1or2_digits(pil: Image.Image) -> Optional[str]:
+    if pytesseract is None:
+        return None
+    base = _autotrim_to_content(pil, bg_is_white=True)
+    # A) direct 1–2 digits (fast)
+    for scale in (2, 3):
+        im = base.resize((max(1, base.width*scale), max(1, base.height*scale)), resample=RESAMPLE_NEAREST)
+        for thresh in (150, 165, 180):
+            for inv in (False, True):
+                bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
+                for psm in (7, 8, 6):
+                    s = _tess(bw, "0123456789", psm)
+                    s = re.sub(r"[^0-9]", "", s)
+                    if 1 <= len(s) <= 2:
+                        if len(s) == 1 and s in {"2", "7"} and _looks_like_zero(base):
+                            return "0"
+                        return s
+    # B) halves
+    W, H = base.size
+    mid = max(1, W // 2)
+    left  = base.crop((0, 0, mid, H))
+    right = base.crop((mid, 0, W, H))
+    d1 = _read_digit_strict(left)
+    d2 = _read_digit_strict(right)
+    if d1 and d2: return f"{d1}{d2}"
+    if d1: return d1
+    if d2: return d2
+    return None
 
-def extract_scoreboard_from_video(
-    video_path: str,
-    *,
-    viz: bool = False,
-    dx: int = 0,
-    dy: int = 0,
-    t: float = 0.10,   # start a bit after 0s to avoid overlay fade-in
-) -> dict:
-    """
-    Pipeline with per-side score voting:
-      sample frames at [t, t+0.10, t+0.20, t+0.30, t+0.40] -> crop -> OCR
-      vote for AWAY and HOME scores separately, then return the earliest reading matching both.
-    If viz=True, saves:
-      data/tmp/video_frame_t{ts}.png
-      data/tmp/frame_with_scorebar_box_t{ts}.png
-      data/tmp/scorebar_t{ts}.png
-      data/tmp/ocr_debug/boxes.png (from the last attempt)
-    """
+def _ocr_quarter_light_multi(pil: Image.Image) -> Optional[str]:
+    tried: List[str] = []
+    for scale in (1, 2):
+        im = pil.resize((max(1, pil.width*scale), max(1, pil.height*scale)), resample=RESAMPLE_NEAREST) if scale > 1 else pil
+        for thresh in (150, 170):
+            for inv in (False, True):
+                bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
+                for psm in (6, 7, 10, 13):
+                    s = _tess(bw, "0123456789QOTNDRSTH", psm)
+                    s = re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+                    tried.append(s)
+                    q = _normalize_quarter(s)
+                    if q:
+                        return q
+    for s in tried:
+        s2 = s.replace("0T", "OT").replace("QI", "Q1").replace("QT", "Q1")
+        q = _normalize_quarter(s2)
+        if q:
+            return q
+    return None
+
+def _extract_fields_fast_with_px_rois(scorebar_path: str, ref: _RefSize) -> Dict[str, Optional[str]]:
+    with Image.open(scorebar_path) as sb:
+        away_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["away_team"], ref))
+        home_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["home_team"], ref))
+        away_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["away_score"], ref))
+        home_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["home_score"], ref))
+        q_norm = _ocr_quarter_light_multi(_crop_px_from_ref(sb, SB_ROIS_PX["quarter"], ref))
+        c_norm = _ocr_clock_fast(_crop_px_from_ref(sb, SB_ROIS_PX["clock"], ref))
+        score_norm = f"{away_digit}-{home_digit}" if (away_digit is not None and home_digit is not None) else None
+        return {
+            "away_team": away_team_txt or None,
+            "home_team": home_team_txt or None,
+            "away_score": away_digit,
+            "home_score": home_digit,
+            "score": score_norm,
+            "clock": c_norm,
+            "quarter": q_norm,
+        }
+
+def _viz_px_rois(scorebar_path: str, out_base: str, ref: _RefSize) -> None:
+    with Image.open(scorebar_path) as sb:
+        _ = _crop_px_from_ref(sb, SB_ROIS_PX["away_team"], ref)
+        w, h = sb.size
+        rw, rh = (ref.w or w), (ref.h or h)
+        sx = w / float(rw); sy = h / float(rh)
+        vis = sb.copy(); d = ImageDraw.Draw(vis)
+        colors = {
+            "away_team": "orange",
+            "home_team": "orange",
+            "away_score":"lime",
+            "home_score":"lime",
+            "quarter":   "deepskyblue",
+            "clock":     "deepskyblue",
+        }
+        Path(out_base).parent.mkdir(parents=True, exist_ok=True)
+        for key, (x0,y0,x1,y1) in SB_ROIS_PX.items():
+            X0, Y0 = int(round(x0*sx)), int(round(y0*sy))
+            X1, Y1 = int(round(x1*sx)), int(round(y1*sy))
+            d.rectangle((X0, Y0, X1, Y1), outline=colors.get(key,"yellow"), width=3)
+        vis.save(f"{out_base}_zones.png")
+        for k in SB_ROIS_PX.keys():
+            c = _crop_px_from_ref(sb, SB_ROIS_PX[k], ref)
+            c.save(f"{out_base}_{k}_raw.png")
+            _prep_gray_bw(c).save(f"{out_base}_{k}_bw.png")
+
+# ---------- LEGACY FALLBACK (no/failed Tesseract) ----------
+def _legacy_extract(video_path: str, *, viz: bool, dx: int, dy: int, t: float) -> dict:
     attempts: List[float] = [max(0.0, t + k*0.10) for k in range(5)]
     readings: List[Tuple[float, dict]] = []
-
     away_counts: Dict[int,int] = {}
     home_counts: Dict[int,int] = {}
-
     last_data: Optional[dict] = None
 
     for idx, ts in enumerate(attempts):
         frame_png = grab_frame_at_time(video_path, ts, out_path=f"data/tmp/video_frame_t{ts:.2f}.png")
         if viz:
             draw_frame_crop_outline(str(frame_png), out_path=f"data/tmp/frame_with_scorebar_box_t{ts:.2f}.png")
-
         scorebar_png = crop_scorebar_from_frame(str(frame_png), out_path=f"data/tmp/scorebar_t{ts:.2f}.png")
-
-        # Enable debug crops + boxes overlay only on the last attempt (to avoid overwriting per try)
         debug_flag = viz and (idx == len(attempts) - 1)
-        result = extract_scoreboard_from_image(
-            str(scorebar_png),
-            debug_crops=debug_flag,
-            viz_boxes_flag=debug_flag,
-            dx=dx,
-            dy=dy,
-        )
+        result = extract_scoreboard_from_image(str(scorebar_png),
+                                               debug_crops=debug_flag,
+                                               viz_boxes_flag=debug_flag,
+                                               dx=dx, dy=dy)
         data = result.to_dict()
         last_data = data
         readings.append((ts, data))
 
-        st = _parse_score_tuple(data.get("score"))
-        if st:
-            a, b = st
-            away_counts[a] = away_counts.get(a, 0) + 1
-            home_counts[b] = home_counts.get(b, 0) + 1
+        m = _SCORE_RX.match((data.get("score") or "").replace(":", "-"))
+        if m:
+            try:
+                a, b = int(m.group(1)), int(m.group(2))
+                away_counts[a] = away_counts.get(a, 0) + 1
+                home_counts[b] = home_counts.get(b, 0) + 1
+            except Exception:
+                pass
 
-    # Compute modal AWAY and HOME separately
     away_mode = _mode_int(away_counts)
     home_mode = _mode_int(home_counts)
 
     if away_mode is not None and home_mode is not None:
-        # Return earliest reading that matches both modal sides
-        for ts, data in readings:
-            st = _parse_score_tuple(data.get("score"))
-            if st == (away_mode, home_mode):
+        for _, data in readings:
+            m = _SCORE_RX.match((data.get("score") or "").replace(":", "-"))
+            if m and (int(m.group(1)), int(m.group(2))) == (away_mode, home_mode):
                 return data
-        # If no reading exactly matches both, synthesize a coherent result from the earliest reading
-        # (teams/quarter/clock are consistent across these few frames)
         synth = dict(last_data or {})
         synth["score"] = f"{away_mode}-{home_mode}"
         return synth
 
-    # Fallback: if only one side got a mode, patch that side into the last reading
     if last_data and (away_mode is not None or home_mode is not None):
-        st = _parse_score_tuple(last_data.get("score")) or (away_mode or 0, home_mode or 0)
-        a = away_mode if away_mode is not None else st[0]
-        b = home_mode if home_mode is not None else st[1]
+        m = _SCORE_RX.match((last_data.get("score") or "").replace(":", "-"))
+        if m:
+            a0, b0 = int(m.group(1)), int(m.group(2))
+        else:
+            a0, b0 = away_mode or 0, home_mode or 0
+        a = away_mode if away_mode is not None else a0
+        b = home_mode if home_mode is not None else b0
         patched = dict(last_data)
         patched["score"] = f"{a}-{b}"
         return patched
 
-    # Last resort
     return last_data or {"used_stub": True}
+
+# ----- main entry -----
+def extract_scoreboard_from_video(
+    video_path: str,
+    *,
+    viz: bool = False,
+    dx: int = 0,
+    dy: int = 0,
+    t: float = 0.10,
+    fast_ocr: bool = True,
+) -> dict:
+    """
+    Fast path (pytesseract + pixel ROIs) with legacy fallback if Tesseract unavailable.
+    """
+    attempts: List[float] = [max(0.0, t + k*0.10) for k in range(3)]
+    use_fast = fast_ocr and (pytesseract is not None)
+
+    if not use_fast:
+        return _legacy_extract(video_path, viz=viz, dx=dx, dy=dy, t=t)
+
+    stable_needed = 2
+    away_votes: Dict[int,int] = {}
+    home_votes: Dict[int,int] = {}
+
+    clocks: List[str] = []
+    qtrs:   List[str] = []
+    teams_a: List[str] = []
+    teams_b: List[str] = []
+    first_reading: Optional[dict] = None
+    last_reading: Optional[dict] = None
+
+    # Per-call reference (no globals)
+    ref = _RefSize()
+
+    for idx, ts in enumerate(attempts):
+        frame_png = grab_frame_at_time(video_path, ts, out_path=f"data/tmp/video_frame_t{ts:.2f}.png")
+        if viz and idx == 0:
+            draw_frame_crop_outline(str(frame_png), out_path=f"data/tmp/frame_with_scorebar_box_t{ts:.2f}.png")
+        scorebar_png = crop_scorebar_from_frame(str(frame_png), out_path=f"data/tmp/scorebar_t{ts:.2f}.png")
+
+        if viz and idx == 0:
+            _viz_px_rois(str(scorebar_png), out_base=f"data/tmp/scorebar_viz_t{ts:.2f}", ref=ref)
+
+        try:
+            fields = _extract_fields_fast_with_px_rois(str(scorebar_png), ref=ref)
+        except Exception:
+            # If fast path throws for any reason (e.g., tesseract call), fall back gracefully
+            return _legacy_extract(video_path, viz=viz, dx=dx, dy=dy, t=t)
+
+        if idx == 0:
+            reading = {
+                "away_team": fields.get("away_team"),
+                "home_team": fields.get("home_team"),
+                "away_score": fields.get("away_score"),
+                "home_score": fields.get("home_score"),
+                "score": fields.get("score"),
+                "clock": fields.get("clock"),
+                "quarter": fields.get("quarter"),
+            }
+            if reading["away_team"]: teams_a.append(reading["away_team"])
+            if reading["home_team"]: teams_b.append(reading["home_team"])
+            if reading.get("clock"): clocks.append(reading["clock"])  # type: ignore[arg-type]
+            if reading.get("quarter"): qtrs.append(reading["quarter"])  # type: ignore[arg-type]
+        else:
+            reading = {
+                "away_team": None, "home_team": None,
+                "away_score": fields.get("away_score"),
+                "home_score": fields.get("home_score"),
+                "score": fields.get("score"),
+                "clock": None, "quarter": None,
+            }
+
+        if first_reading is None:
+            first_reading = dict(reading)
+        last_reading = dict(reading)
+
+        av = _to_int_or_none(reading.get("away_score"))
+        if av is not None:
+            away_votes[av] = away_votes.get(av, 0) + 1
+        hv = _to_int_or_none(reading.get("home_score"))
+        if hv is not None:
+            home_votes[hv] = home_votes.get(hv, 0) + 1
+
+        a_mode = _mode_int(away_votes)
+        b_mode = _mode_int(home_votes)
+
+        if a_mode is not None and b_mode is not None:
+            if away_votes[a_mode] >= stable_needed and home_votes[b_mode] >= stable_needed:
+                out = dict(first_reading or {})
+                out["away_team"] = _mode_val(teams_a) or out.get("away_team")
+                out["home_team"] = _mode_val(teams_b) or out.get("home_team")
+                out["away_score"] = str(a_mode)
+                out["home_score"] = str(b_mode)
+                out["score"] = f"{a_mode}-{b_mode}"
+                clk_mode = _mode_val(clocks)
+                q_mode   = _mode_val(qtrs)
+                if clk_mode: out["clock"] = clk_mode
+                if q_mode:   out["quarter"] = q_mode
+                return out
+
+    a_mode = _mode_int(away_votes)
+    b_mode = _mode_int(home_votes)
+    out = dict(first_reading or last_reading or {})
+    out["away_team"] = _mode_val(teams_a) or out.get("away_team")
+    out["home_team"] = _mode_val(teams_b) or out.get("home_team")
+    if a_mode is not None: out["away_score"] = str(a_mode)
+    if b_mode is not None: out["home_score"] = str(b_mode)
+    if a_mode is not None and b_mode is not None: out["score"] = f"{a_mode}-{b_mode}"
+    clk_mode = _mode_val(clocks); q_mode = _mode_val(qtrs)
+    if clk_mode: out["clock"] = clk_mode
+    if q_mode:   out["quarter"] = q_mode
+    return out or {"used_stub": True}
 
 if __name__ == "__main__":
     import sys
-    # Usage:
-    #   python -m backend.services.ocr_from_video "Madden Clip.mp4" [--viz] [--dx=<int>] [--dy=<int>] [--t=<seconds>]
     video = sys.argv[1] if len(sys.argv) > 1 else "Madden Clip.mp4"
-    flags = {a for a in sys.argv[2:] if a.startswith("--") and "=" not in a}
-    kvs = [a for a in sys.argv[2:] if a.startswith("--") and "=" in a]
-    viz = ("--viz" in flags)
-    dx = dy = 0
-    t = 0.10
-    for kv in kvs:
-        if kv.startswith("--dx="):
-            try: dx = int(kv.split("=",1)[1])
-            except: pass
-        elif kv.startswith("--dy="):
-            try: dy = int(kv.split("=",1)[1])
-            except: pass
-        elif kv.startswith("--t="):
-            try: t = float(kv.split("=",1)[1])
-            except: pass
-
-    data = extract_scoreboard_from_video(video, viz=viz, dx=dx, dy=dy, t=t)
+    data = extract_scoreboard_from_video(video, viz="--viz" in sys.argv)
     print(json.dumps(data, indent=2))
