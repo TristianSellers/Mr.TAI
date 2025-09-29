@@ -5,7 +5,7 @@ from typing import Tuple, List, Dict, Optional
 import subprocess, shlex, json, re
 from collections import Counter
 
-from .ocr import extract_scoreboard_from_image, draw_boxes  # kept for parity
+from .ocr import extract_scoreboard_from_image, draw_boxes  # legacy extractor (fallback)
 
 # Optional OpenCV for grabbing frames
 try:
@@ -23,7 +23,7 @@ except Exception as e:
 try:
     RESAMPLE_NEAREST = Image.Resampling.NEAREST   # Pillow ≥ 9.1
 except Exception:
-    RESAMPLE_NEAREST = 0                          # integer code for NEAREST (older Pillow)
+    RESAMPLE_NEAREST = 0                          # older Pillow integer code
 
 # Optional pytesseract for fast path
 try:
@@ -35,7 +35,7 @@ except Exception:
 REF_FRAME_W, REF_FRAME_H = 2047, 1155
 SCOREBAR_BOX = (0, 1080, 2047, 1155)  # (left, top, right, bottom) in reference space
 
-# ----- Your EXACT pixel ROIs on the scoreboard crop (x0, y0, x1, y1) -----
+# ----- EXACT pixel ROIs on the scoreboard crop (x0, y0, x1, y1) -----
 SB_ROIS_PX: Dict[str, Tuple[int, int, int, int]] = {
     "away_team":  (500,  0, 600, 50),
     "home_team":  (900,  0, 1000,50),
@@ -63,7 +63,6 @@ def _normalize_quarter(s: Optional[str]) -> Optional[str]:
     m2 = _QTR_RX_QN.match(s)
     if m2:
         return m2.group(1).upper()
-    # extra: lone digit 1-4 -> Qx
     if re.fullmatch(r"[1-4]", s):
         return f"Q{s}"
     return None
@@ -190,9 +189,8 @@ def _center_white_ratio(img: Image.Image) -> float:
 
 def _looks_like_zero(pil: Image.Image) -> bool:
     """
-    Upscale, binarize (both normal & inverted). If the center box has a much higher
+    Upscale, binarize (both normal & inverted). If the center box has a notably higher
     white ratio than the surrounding ring in either polarity, it’s likely a '0'.
-    Lowered margin (0.08) to better catch red 0s.
     """
     im = pil.resize((max(1, pil.width*3), max(1, pil.height*3)), resample=RESAMPLE_NEAREST)
     for invert in (False, True):
@@ -208,43 +206,31 @@ def _looks_like_zero(pil: Image.Image) -> bool:
 
 def _read_digit_strict(pil: Image.Image) -> Optional[str]:
     """
-    Single-digit robust read with auto-trim:
-      - auto-trim margins
-      - 2–3× upscale
-      - digits-only whitelist
-      - psm=10/13 (single char)
-      - thresholds + invert
-      - majority vote; if 2/7 wins but donut says zero, coerce to 0
-      - final fallback: allow 'O' and map to 0
+    Single-digit robust read with auto-trim + RANSAC-like voting.
     """
     if pytesseract is None:
         return None
-
     base = _autotrim_to_content(pil, bg_is_white=True)
-
     votes: List[str] = []
     for scale in (2, 3):
         im = base.resize((max(1, base.width*scale), max(1, base.height*scale)), resample=RESAMPLE_NEAREST)
         for thresh in (145, 160, 170, 185):
             for inv in (False, True):
                 bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
-                for psm in (10, 13):
+                for psm in (10, 13):  # single char
                     s = _tess(bw, "0123456789", psm)
                     s = re.sub(r"[^0-9]", "", s)
                     if len(s) == 1:
                         votes.append(s)
-
     if votes:
         pick, _ = Counter(votes).most_common(1)[0]
         if pick in {"7", "2"} and _looks_like_zero(base):
             return "0"
         return pick
-
-    # fallback that permits 'O' -> '0'
+    # fallback: allow 'O' -> '0'
     im2 = base.resize((max(1, base.width*3), max(1, base.height*3)), resample=RESAMPLE_NEAREST)
     s2 = _tess(_prep_gray_bw(im2, thresh=165, invert=False), "O0123456789", psm=10)
-    s2 = s2.replace("O", "0")
-    s2 = re.sub(r"[^0-9]", "", s2)
+    s2 = re.sub(r"[^0-9O]", "", s2).replace("O", "0")
     if len(s2) == 1:
         if s2 in {"7", "2"} and _looks_like_zero(base):
             return "0"
@@ -253,38 +239,33 @@ def _read_digit_strict(pil: Image.Image) -> Optional[str]:
 
 def _read_score_1or2_digits(pil: Image.Image) -> Optional[str]:
     """
-    Try to read a 1–2 digit score from a single ROI.
-    1) direct 1–2 char read (fast)
-    2) if that fails, split ROI into halves and read each with _read_digit_strict (keeps donut fix)
+    Try to read a 1–2 digit score from a single ROI:
+      A) direct 1–2 digit read (fast)
+      B) fallback: split ROI into halves and read each with _read_digit_strict
     """
     if pytesseract is None:
         return None
-
     base = _autotrim_to_content(pil, bg_is_white=True)
-
-    # Pass A: direct 1–2 digits using line/word PSMs
+    # A) direct
     for scale in (2, 3):
         im = base.resize((max(1, base.width*scale), max(1, base.height*scale)), resample=RESAMPLE_NEAREST)
         for thresh in (150, 165, 180):
             for inv in (False, True):
                 bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
-                for psm in (7, 8, 6):  # line/word/block-ish
+                for psm in (7, 8, 6):  # line/word
                     s = _tess(bw, "0123456789", psm)
                     s = re.sub(r"[^0-9]", "", s)
                     if 1 <= len(s) <= 2:
                         if len(s) == 1 and s in {"2", "7"} and _looks_like_zero(base):
                             return "0"
                         return s
-
-    # Pass B: split ROI into two halves and read each digit strictly
+    # B) halves
     W, H = base.size
     mid = max(1, W // 2)
     left  = base.crop((0, 0, mid, H))
     right = base.crop((mid, 0, W, H))
-
     d1 = _read_digit_strict(left)
     d2 = _read_digit_strict(right)
-
     if d1 and d2:
         return f"{d1}{d2}"
     if d1:
@@ -318,16 +299,11 @@ def _extract_fields_fast_with_px_rois(scorebar_path: str) -> Dict[str, Optional[
     with Image.open(scorebar_path) as sb:
         away_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["away_team"]))
         home_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["home_team"]))
-
-        # NEW: support 1–2 digit scores
         away_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["away_score"]))
         home_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["home_score"]))
-
         q_norm = _ocr_quarter_light_multi(_crop_px_from_ref(sb, SB_ROIS_PX["quarter"]))
         c_norm = _ocr_clock_fast(_crop_px_from_ref(sb, SB_ROIS_PX["clock"]))
-
         score_norm = f"{away_digit}-{home_digit}" if (away_digit is not None and home_digit is not None) else None
-
         return {
             "away_team": away_team_txt or None,
             "home_team": home_team_txt or None,
@@ -344,7 +320,6 @@ def _viz_px_rois(scorebar_path: str, out_base: str) -> None:
         w, h = sb.size
         ref_w, ref_h = _SB_REF_OVERRIDE or (w, h)
         sx = w / float(ref_w); sy = h / float(ref_h)
-
         vis = sb.copy(); d = ImageDraw.Draw(vis)
         colors = {
             "away_team": "orange",
@@ -365,6 +340,68 @@ def _viz_px_rois(scorebar_path: str, out_base: str) -> None:
             c.save(f"{out_base}_{k}_raw.png")
             _prep_gray_bw(c).save(f"{out_base}_{k}_bw.png")
 
+# ---------- LEGACY FALLBACK (no Tesseract) ----------
+def _legacy_extract(video_path: str, *, viz: bool, dx: int, dy: int, t: float) -> dict:
+    """
+    Original multi-frame extractor using extract_scoreboard_from_image with per-side voting.
+    """
+    attempts: List[float] = [max(0.0, t + k*0.10) for k in range(5)]
+    readings: List[Tuple[float, dict]] = []
+    away_counts: Dict[int,int] = {}
+    home_counts: Dict[int,int] = {}
+    last_data: Optional[dict] = None
+
+    for idx, ts in enumerate(attempts):
+        frame_png = grab_frame_at_time(video_path, ts, out_path=f"data/tmp/video_frame_t{ts:.2f}.png")
+        if viz:
+            draw_frame_crop_outline(str(frame_png), out_path=f"data/tmp/frame_with_scorebar_box_t{ts:.2f}.png")
+        scorebar_png = crop_scorebar_from_frame(str(frame_png), out_path=f"data/tmp/scorebar_t{ts:.2f}.png")
+
+        # debug crops/boxes only on the last attempt
+        debug_flag = viz and (idx == len(attempts) - 1)
+        result = extract_scoreboard_from_image(str(scorebar_png),
+                                               debug_crops=debug_flag,
+                                               viz_boxes_flag=debug_flag,
+                                               dx=dx, dy=dy)
+        data = result.to_dict()
+        last_data = data
+        readings.append((ts, data))
+
+        m = _SCORE_RX.match((data.get("score") or "").replace(":", "-"))
+        if m:
+            try:
+                a, b = int(m.group(1)), int(m.group(2))
+                away_counts[a] = away_counts.get(a, 0) + 1
+                home_counts[b] = home_counts.get(b, 0) + 1
+            except Exception:
+                pass
+
+    away_mode = _mode_int(away_counts)
+    home_mode = _mode_int(home_counts)
+
+    if away_mode is not None and home_mode is not None:
+        for _, data in readings:
+            m = _SCORE_RX.match((data.get("score") or "").replace(":", "-"))
+            if m and (int(m.group(1)), int(m.group(2))) == (away_mode, home_mode):
+                return data
+        synth = dict(last_data or {})
+        synth["score"] = f"{away_mode}-{home_mode}"
+        return synth
+
+    if last_data and (away_mode is not None or home_mode is not None):
+        m = _SCORE_RX.match((last_data.get("score") or "").replace(":", "-"))
+        if m:
+            a0, b0 = int(m.group(1)), int(m.group(2))
+        else:
+            a0, b0 = away_mode or 0, home_mode or 0
+        a = away_mode if away_mode is not None else a0
+        b = home_mode if home_mode is not None else b0
+        patched = dict(last_data)
+        patched["score"] = f"{a}-{b}"
+        return patched
+
+    return last_data or {"used_stub": True}
+
 # ----- main entry -----
 def extract_scoreboard_from_video(
     video_path: str,
@@ -375,10 +412,15 @@ def extract_scoreboard_from_video(
     t: float = 0.10,
     fast_ocr: bool = True,
 ) -> dict:
+    """
+    Fast path (pytesseract + pixel ROIs) with legacy fallback if Tesseract unavailable.
+    """
     attempts: List[float] = [max(0.0, t + k*0.10) for k in range(3)]
     use_fast = fast_ocr and (pytesseract is not None)
+
     if not use_fast:
-        return {"used_stub": True}
+        # Proper fallback to original extractor (no stub)
+        return _legacy_extract(video_path, viz=viz, dx=dx, dy=dy, t=t)
 
     stable_needed = 2
     away_votes: Dict[int,int] = {}
