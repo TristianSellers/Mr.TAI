@@ -251,6 +251,48 @@ def _read_digit_strict(pil: Image.Image) -> Optional[str]:
         return s2
     return None
 
+def _read_score_1or2_digits(pil: Image.Image) -> Optional[str]:
+    """
+    Try to read a 1–2 digit score from a single ROI.
+    1) direct 1–2 char read (fast)
+    2) if that fails, split ROI into halves and read each with _read_digit_strict (keeps donut fix)
+    """
+    if pytesseract is None:
+        return None
+
+    base = _autotrim_to_content(pil, bg_is_white=True)
+
+    # Pass A: direct 1–2 digits using line/word PSMs
+    for scale in (2, 3):
+        im = base.resize((max(1, base.width*scale), max(1, base.height*scale)), resample=RESAMPLE_NEAREST)
+        for thresh in (150, 165, 180):
+            for inv in (False, True):
+                bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
+                for psm in (7, 8, 6):  # line/word/block-ish
+                    s = _tess(bw, "0123456789", psm)
+                    s = re.sub(r"[^0-9]", "", s)
+                    if 1 <= len(s) <= 2:
+                        if len(s) == 1 and s in {"2", "7"} and _looks_like_zero(base):
+                            return "0"
+                        return s
+
+    # Pass B: split ROI into two halves and read each digit strictly
+    W, H = base.size
+    mid = max(1, W // 2)
+    left  = base.crop((0, 0, mid, H))
+    right = base.crop((mid, 0, W, H))
+
+    d1 = _read_digit_strict(left)
+    d2 = _read_digit_strict(right)
+
+    if d1 and d2:
+        return f"{d1}{d2}"
+    if d1:
+        return d1
+    if d2:
+        return d2
+    return None
+
 def _ocr_quarter_light_multi(pil: Image.Image) -> Optional[str]:
     tried: List[str] = []
     for scale in (1, 2):
@@ -277,8 +319,9 @@ def _extract_fields_fast_with_px_rois(scorebar_path: str) -> Dict[str, Optional[
         away_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["away_team"]))
         home_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["home_team"]))
 
-        away_digit = _read_digit_strict(_crop_px_from_ref(sb, SB_ROIS_PX["away_score"]))
-        home_digit = _read_digit_strict(_crop_px_from_ref(sb, SB_ROIS_PX["home_score"]))
+        # NEW: support 1–2 digit scores
+        away_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["away_score"]))
+        home_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["home_score"]))
 
         q_norm = _ocr_quarter_light_multi(_crop_px_from_ref(sb, SB_ROIS_PX["quarter"]))
         c_norm = _ocr_clock_fast(_crop_px_from_ref(sb, SB_ROIS_PX["clock"]))
