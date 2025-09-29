@@ -17,7 +17,7 @@ def mux_audio_video(video_path: str | Path, audio_path: str | Path, out_path: st
 
     cmd = (
         f'ffmpeg -y -i {shlex.quote(str(video_path))} -i {shlex.quote(str(audio_path))} '
-        f'-c:v copy -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest '
+        f'-c:v copy -c:a aac -ar 48000 -ac 2 -b:a 128k -map 0:v:0 -map 1:a:0 -shortest '
         f'{shlex.quote(str(out_path))}'
     )
     subprocess.run(shlex.split(cmd), check=True)

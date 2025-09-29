@@ -2,14 +2,12 @@
 from __future__ import annotations
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
-from typing import Optional, Iterable, Dict, Any
+from typing import Optional, Iterable, Dict, Any, List
 from pathlib import Path, PurePath
 import shutil, os, uuid, subprocess, shlex
 
 from backend.services.ocr_from_video import extract_scoreboard_from_video
 from backend.services.context_from_ocr import ocr_to_commentary_context
-
-# Reuse the same services used by analyze_commentate
 from backend.services.llm_providers import get_llm
 from backend.services.tts_providers import get_tts
 from backend.services.tone_profiles import build_llm_prompt, normalize_tone
@@ -47,7 +45,6 @@ def _safe_save_upload(upload: UploadFile, allow_exts: Iterable[str]) -> Path:
     tmp_root = TMP_DIR.resolve()
     if not str(dest).startswith(str(tmp_root) + os.sep):
         raise HTTPException(status_code=400, detail="Invalid upload destination")
-
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(str(dest), flags, 0o600)
     try:
@@ -72,6 +69,44 @@ class CommentaryRunResponse(BaseModel):
     audio_url: Optional[str] = None
     video_url: Optional[str] = None
     meta: Dict[str, Any]
+
+# ---------- Voice catalog & mapping ----------
+# Your verified 6 voices
+VOICE_CATALOG: List[Dict[str, Any]] = [
+    {"id": "tc_673eb45cdc1073aef51e6b90", "name": "Dean",    "gender": "male",   "emotions": ["tonedown", "normal", "toneup"]},
+    {"id": "tc_6412c42d733f60ab8ad369a9", "name": "Caitlyn", "gender": "female", "emotions": ["normal"]},
+    {"id": "tc_6837b58f80ceeb17115bb771", "name": "Walter",  "gender": "male",   "emotions": ["normal"]},
+    {"id": "tc_684a5a7ba2ce934624b59c6e", "name": "Nia",     "gender": "female", "emotions": ["normal", "tonedown"]},
+    {"id": "tc_623145940c2c1ff30c30f3a9", "name": "Matthew", "gender": "male",   "emotions": ["normal", "shout"]},
+    {"id": "tc_630494521f5003bebbfdafef", "name": "Rachel",  "gender": "female", "emotions": ["normal", "toneup", "happy"]},
+]
+
+# Preferred voice per (tone,gender)
+VOICE_BY_TONE_GENDER = {
+    "neutral": {"male": "tc_673eb45cdc1073aef51e6b90", "female": "tc_6412c42d733f60ab8ad369a9"},  # Dean / Caitlyn
+    "radio":   {"male": "tc_6837b58f80ceeb17115bb771", "female": "tc_684a5a7ba2ce934624b59c6e"},  # Walter / Nia
+    "hype":    {"male": "tc_623145940c2c1ff30c30f3a9", "female": "tc_630494521f5003bebbfdafef"},  # Matthew / Rachel
+}
+
+# Emotion preference per tone (used for previews & fallback)
+PREFERRED_BY_TONE = {
+    "neutral": ["normal"],
+    "radio":   ["tonedown", "normal", "tonemid"],
+    "hype":    ["shout", "toneup", "happy", "normal"],
+}
+
+# Explicit emotion hint per (tone,gender) for run pipeline (matches supports)
+EMOTION_BY_TONE_GENDER = {
+    "neutral": {"male": "normal",  "female": "normal"},
+    "radio":   {"male": "normal",  "female": "tonedown"},  # Walter only normal; Nia supports tonedown
+    "hype":    {"male": "shout",   "female": "toneup"},    # Matthew shout; Rachel toneup
+}
+
+def _pick_emotion(tone: str, supported: List[str]) -> str:
+    for e in PREFERRED_BY_TONE.get(tone, ["normal"]):
+        if e in supported:
+            return e
+    return "normal"
 
 # ---------- Helpers ----------
 def _to_wav_from_mp3(mp3_path: Path) -> Path:
@@ -110,15 +145,13 @@ def run_commentary_from_video(
     dx: int = Form(0),
     dy: int = Form(0),
     t: float = Form(0.10),
-    # allow optional override of tone/bias; falls back to defaults in context_from_ocr
     tone: Optional[str] = Form(None),
     bias: Optional[str] = Form(None),
+    gender: Optional[str] = Form(None),
     audio_only: bool = Form(False),
 ):
     """
-    One-shot pipeline:
-      upload video -> OCR -> build context -> LLM -> TTS -> (optional) mux
-    Returns the same shape as AnalyzeOut for consistency with your UI.
+    upload video -> OCR -> build context -> LLM -> TTS -> (optional) mux
     """
     dest = _safe_save_upload(video, VIDEO_EXTS)
     keep_uploads = os.getenv("KEEP_UPLOADS", "0") == "1"
@@ -128,22 +161,35 @@ def run_commentary_from_video(
         # 1) OCR -> context
         ocr = extract_scoreboard_from_video(str(dest), viz=viz, dx=dx, dy=dy, t=t)
         ctx = ocr_to_commentary_context(ocr)
-        if tone:
-            ctx["tone"] = tone
-        if bias:
-            ctx["bias"] = bias
+        if tone: ctx["tone"] = tone
+        if bias: ctx["bias"] = bias
+
+        tone_val = normalize_tone(str(ctx.get("tone", "neutral")))
+        if tone_val not in ("neutral", "radio", "hype"):
+            tone_val = "neutral"
+        gender_val = (gender or "male").strip().lower()
+        if gender_val not in ("male", "female"):
+            gender_val = "male"
 
         # 2) LLM
         llm = get_llm()
         prompt = build_llm_prompt(ctx)
-        text = llm.generate(prompt, meta={"tone": normalize_tone(str(ctx.get("tone", "play-by-play"))),
-                                          "bias": str(ctx.get("bias", "neutral")).lower()})
+        text = llm.generate(
+            prompt,
+            meta={"tone": tone_val, "bias": str(ctx.get("bias", "neutral")).lower(), "gender": gender_val},
+        )
 
-        # 3) TTS (mp3)
+        # 3) TTS
         tts = get_tts()
-        audio_mp3_path = tts.synth_to_file(text, DATA_DIR / "uploads" / "tts",
-                                           tone=str(ctx.get("tone", "play-by-play")),
-                                           bias=str(ctx.get("bias", "neutral")))  # type: ignore[call-arg]
+        voice_id = VOICE_BY_TONE_GENDER.get(tone_val, {}).get(gender_val)
+        emotion = EMOTION_BY_TONE_GENDER.get(tone_val, {}).get(gender_val, "normal")
+        audio_mp3_path = tts.synth_to_file(
+            text, DATA_DIR / "uploads" / "tts",
+            tone=tone_val,
+            bias=str(ctx.get("bias", "neutral")),
+            voice_id=voice_id,
+            emotion_preset=emotion,
+        )  # type: ignore[call-arg]
         audio_mp3 = Path(audio_mp3_path)
 
         # 4) Mux (if not audio-only)
@@ -153,7 +199,7 @@ def run_commentary_from_video(
             vid_out_path = mux_audio_video(str(dest), str(audio_wav))
             video_out = Path(vid_out_path) if isinstance(vid_out_path, str) else vid_out_path
 
-        # 5) Build response (align with AnalyzeOut)
+        # 5) Response
         return CommentaryRunResponse(
             id=run_id,
             text=text,
@@ -162,11 +208,12 @@ def run_commentary_from_video(
             meta={
                 "usedManualContext": False,
                 "provider": {"llm": type(llm).__name__, "tts": type(tts).__name__},
-                "prompt_tone": normalize_tone(str(ctx.get("tone", "play-by-play"))),
+                "prompt_tone": tone_val,
                 "prompt_bias": str(ctx.get("bias", "neutral")).lower(),
+                "gender": gender_val,
                 "audio_only": audio_only,
                 "ocr_used_stub": bool(ocr.get("used_stub", False)),
-                "ocr_raw": ocr,  # helpful for debugging
+                "ocr_raw": ocr,
             },
         )
     except Exception as e:
@@ -177,3 +224,57 @@ def run_commentary_from_video(
                 dest.unlink(missing_ok=True)
             except Exception:
                 pass
+
+# ---------- Voice options (for audition UI) ----------
+@router.get("/voice-options")
+def voice_options(tone: Optional[str] = None, gender: Optional[str] = None):
+    tone_val = normalize_tone(str(tone or "neutral"))
+    items = [v for v in VOICE_CATALOG if (not gender or v["gender"] == gender)]
+    out = []
+    for v in items:
+        out.append({
+            **v,
+            "suggested_emotion": _pick_emotion(tone_val, v["emotions"]),
+        })
+    return {"voices": out, "tone": tone_val, "gender": (gender or "").lower() or None}
+
+# ---------- Voice preview (audition any voice) ----------
+@router.post("/voice-preview")
+def voice_preview(
+    tone: Optional[str] = Form("neutral"),
+    bias: Optional[str] = Form("neutral"),
+    gender: Optional[str] = Form("male"),
+    text: Optional[str] = Form("Mic check. One-two."),
+    voice_id: Optional[str] = Form(None),
+    emotion_preset: Optional[str] = Form(None),
+):
+    tone_val = normalize_tone(str(tone or "neutral"))
+    gender_val = (gender or "male").strip().lower()
+    if gender_val not in ("male", "female"):
+        gender_val = "male"
+
+    # If not explicitly provided, use the mapped voice and a best-fit emotion
+    if not voice_id:
+        voice_id = VOICE_BY_TONE_GENDER.get(tone_val, {}).get(gender_val)
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="No voice_id available for given tone/gender")
+
+    if not emotion_preset:
+        v = next((v for v in VOICE_CATALOG if v["id"] == voice_id), None)
+        supported = list(v["emotions"]) if v else ["normal"]
+        emotion_preset = _pick_emotion(tone_val, supported)
+
+    tts = get_tts()
+    out_path = tts.synth_to_file(
+        text or "Mic check. One-two.",
+        DATA_DIR / "uploads" / "tts",
+        tone=tone_val,
+        bias=str(bias or "neutral"),
+        voice_id=voice_id,
+        emotion_preset=emotion_preset,
+    )  # type: ignore[call-arg]
+
+    return {
+        "audio_url": to_static_url(Path(out_path)),
+        "meta": {"tone": tone_val, "gender": gender_val, "voice_id": voice_id, "emotion": emotion_preset},
+    }
