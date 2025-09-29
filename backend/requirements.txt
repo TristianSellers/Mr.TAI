@@ -41,7 +41,6 @@ uvicorn==0.35.0
 pillow>=10.3.0
 opencv-python-headless>=4.10.0.84
 pytesseract>=0.3.10
-numpy>=1.26.4
 rapidfuzz>=3.9.5
 
 # Dev tools
