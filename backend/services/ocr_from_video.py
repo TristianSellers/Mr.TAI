@@ -45,8 +45,6 @@ SB_ROIS_PX: Dict[str, Tuple[int, int, int, int]] = {
     "clock":      (1325, 20,1445,50),
 }
 
-_SB_REF_OVERRIDE: Optional[Tuple[int, int]] = None  # (ref_w, ref_h)
-
 # ----- regex/validators -----
 _SCORE_RX   = re.compile(r"^\s*(\d{1,2})\s*[-:]\s*(\d{1,2})\s*$")
 _CLOCK_RX   = re.compile(r"^\s*(\d{1,2}):([0-5]\d)\s*$")
@@ -133,20 +131,25 @@ def draw_frame_crop_outline(frame_path: str, out_path: str = "data/tmp/frame_wit
         vis.save(op)
     return op
 
-# ----- ROI helpers -----
+# ----- per-call ref-size + ROI helpers -----
+class _RefSize:
+    __slots__ = ("w","h")
+    def __init__(self) -> None:
+        self.w: Optional[int] = None
+        self.h: Optional[int] = None
+
 def _prep_gray_bw(pil: Image.Image, thresh: int = 160, invert: bool = False) -> Image.Image:
     g = pil.convert("L")
     table = [0] * (thresh + 1) + [255] * (256 - (thresh + 1))
     bw = g.point(table, mode="L")
     return ImageOps.invert(bw) if invert else bw
 
-def _crop_px_from_ref(sb_img: Image.Image, box_px: Tuple[int,int,int,int]) -> Image.Image:
-    global _SB_REF_OVERRIDE
+def _crop_px_from_ref(sb_img: Image.Image, box_px: Tuple[int,int,int,int], ref: _RefSize) -> Image.Image:
+    """Use a per-call reference size (no globals) for scaling pixel ROIs."""
     w, h = sb_img.size
-    if _SB_REF_OVERRIDE is None:
-        _SB_REF_OVERRIDE = (w, h)
-    ref_w, ref_h = _SB_REF_OVERRIDE
-    sx = w / float(ref_w); sy = h / float(ref_h)
+    if ref.w is None or ref.h is None:
+        ref.w, ref.h = w, h
+    sx = w / float(ref.w); sy = h / float(ref.h)
     x0, y0, x1, y1 = box_px
     X0, Y0 = max(0, int(round(x0 * sx))), max(0, int(round(y0 * sy)))
     X1, Y1 = min(w, int(round(x1 * sx))),  min(h, int(round(y1 * sy)))
@@ -160,12 +163,16 @@ def _autotrim_to_content(pil: Image.Image, bg_is_white: bool = True) -> Image.Im
         return pil.crop(box)
     return pil
 
-# ---- OCR drivers ----
+# ---- OCR drivers (with guarded tesseract calls) ----
 def _tess(pil: Image.Image, allow: str, psm: int) -> str:
     if pytesseract is None:
         return ""
     cfg = f'--psm {psm} -c tessedit_char_whitelist={allow}'
-    return (pytesseract.image_to_string(pil, config=cfg) or "").strip()
+    try:
+        return (pytesseract.image_to_string(pil, config=cfg) or "").strip()
+    except Exception:
+        # Tesseract missing/misconfigured: degrade gracefully
+        return ""
 
 def _single_read_alnum_fast(pil: Image.Image, allow: str) -> str:
     bw = _prep_gray_bw(pil, thresh=160, invert=False)
@@ -188,10 +195,6 @@ def _center_white_ratio(img: Image.Image) -> float:
     return (white / total) if total else 0.0
 
 def _looks_like_zero(pil: Image.Image) -> bool:
-    """
-    Upscale, binarize (both normal & inverted). If the center box has a notably higher
-    white ratio than the surrounding ring in either polarity, it’s likely a '0'.
-    """
     im = pil.resize((max(1, pil.width*3), max(1, pil.height*3)), resample=RESAMPLE_NEAREST)
     for invert in (False, True):
         bw = _prep_gray_bw(im, thresh=170, invert=invert)
@@ -205,9 +208,6 @@ def _looks_like_zero(pil: Image.Image) -> bool:
     return False
 
 def _read_digit_strict(pil: Image.Image) -> Optional[str]:
-    """
-    Single-digit robust read with auto-trim + RANSAC-like voting.
-    """
     if pytesseract is None:
         return None
     base = _autotrim_to_content(pil, bg_is_white=True)
@@ -227,7 +227,6 @@ def _read_digit_strict(pil: Image.Image) -> Optional[str]:
         if pick in {"7", "2"} and _looks_like_zero(base):
             return "0"
         return pick
-    # fallback: allow 'O' -> '0'
     im2 = base.resize((max(1, base.width*3), max(1, base.height*3)), resample=RESAMPLE_NEAREST)
     s2 = _tess(_prep_gray_bw(im2, thresh=165, invert=False), "O0123456789", psm=10)
     s2 = re.sub(r"[^0-9O]", "", s2).replace("O", "0")
@@ -238,21 +237,16 @@ def _read_digit_strict(pil: Image.Image) -> Optional[str]:
     return None
 
 def _read_score_1or2_digits(pil: Image.Image) -> Optional[str]:
-    """
-    Try to read a 1–2 digit score from a single ROI:
-      A) direct 1–2 digit read (fast)
-      B) fallback: split ROI into halves and read each with _read_digit_strict
-    """
     if pytesseract is None:
         return None
     base = _autotrim_to_content(pil, bg_is_white=True)
-    # A) direct
+    # A) direct 1–2 digits (fast)
     for scale in (2, 3):
         im = base.resize((max(1, base.width*scale), max(1, base.height*scale)), resample=RESAMPLE_NEAREST)
         for thresh in (150, 165, 180):
             for inv in (False, True):
                 bw = _prep_gray_bw(im, thresh=thresh, invert=inv)
-                for psm in (7, 8, 6):  # line/word
+                for psm in (7, 8, 6):
                     s = _tess(bw, "0123456789", psm)
                     s = re.sub(r"[^0-9]", "", s)
                     if 1 <= len(s) <= 2:
@@ -266,12 +260,9 @@ def _read_score_1or2_digits(pil: Image.Image) -> Optional[str]:
     right = base.crop((mid, 0, W, H))
     d1 = _read_digit_strict(left)
     d2 = _read_digit_strict(right)
-    if d1 and d2:
-        return f"{d1}{d2}"
-    if d1:
-        return d1
-    if d2:
-        return d2
+    if d1 and d2: return f"{d1}{d2}"
+    if d1: return d1
+    if d2: return d2
     return None
 
 def _ocr_quarter_light_multi(pil: Image.Image) -> Optional[str]:
@@ -295,14 +286,14 @@ def _ocr_quarter_light_multi(pil: Image.Image) -> Optional[str]:
             return q
     return None
 
-def _extract_fields_fast_with_px_rois(scorebar_path: str) -> Dict[str, Optional[str]]:
+def _extract_fields_fast_with_px_rois(scorebar_path: str, ref: _RefSize) -> Dict[str, Optional[str]]:
     with Image.open(scorebar_path) as sb:
-        away_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["away_team"]))
-        home_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["home_team"]))
-        away_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["away_score"]))
-        home_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["home_score"]))
-        q_norm = _ocr_quarter_light_multi(_crop_px_from_ref(sb, SB_ROIS_PX["quarter"]))
-        c_norm = _ocr_clock_fast(_crop_px_from_ref(sb, SB_ROIS_PX["clock"]))
+        away_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["away_team"], ref))
+        home_team_txt = _ocr_letters_fast(_crop_px_from_ref(sb, SB_ROIS_PX["home_team"], ref))
+        away_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["away_score"], ref))
+        home_digit = _read_score_1or2_digits(_crop_px_from_ref(sb, SB_ROIS_PX["home_score"], ref))
+        q_norm = _ocr_quarter_light_multi(_crop_px_from_ref(sb, SB_ROIS_PX["quarter"], ref))
+        c_norm = _ocr_clock_fast(_crop_px_from_ref(sb, SB_ROIS_PX["clock"], ref))
         score_norm = f"{away_digit}-{home_digit}" if (away_digit is not None and home_digit is not None) else None
         return {
             "away_team": away_team_txt or None,
@@ -314,12 +305,12 @@ def _extract_fields_fast_with_px_rois(scorebar_path: str) -> Dict[str, Optional[
             "quarter": q_norm,
         }
 
-def _viz_px_rois(scorebar_path: str, out_base: str) -> None:
+def _viz_px_rois(scorebar_path: str, out_base: str, ref: _RefSize) -> None:
     with Image.open(scorebar_path) as sb:
-        _ = _crop_px_from_ref(sb, SB_ROIS_PX["away_team"])
+        _ = _crop_px_from_ref(sb, SB_ROIS_PX["away_team"], ref)
         w, h = sb.size
-        ref_w, ref_h = _SB_REF_OVERRIDE or (w, h)
-        sx = w / float(ref_w); sy = h / float(ref_h)
+        rw, rh = (ref.w or w), (ref.h or h)
+        sx = w / float(rw); sy = h / float(rh)
         vis = sb.copy(); d = ImageDraw.Draw(vis)
         colors = {
             "away_team": "orange",
@@ -336,15 +327,12 @@ def _viz_px_rois(scorebar_path: str, out_base: str) -> None:
             d.rectangle((X0, Y0, X1, Y1), outline=colors.get(key,"yellow"), width=3)
         vis.save(f"{out_base}_zones.png")
         for k in SB_ROIS_PX.keys():
-            c = _crop_px_from_ref(sb, SB_ROIS_PX[k])
+            c = _crop_px_from_ref(sb, SB_ROIS_PX[k], ref)
             c.save(f"{out_base}_{k}_raw.png")
             _prep_gray_bw(c).save(f"{out_base}_{k}_bw.png")
 
-# ---------- LEGACY FALLBACK (no Tesseract) ----------
+# ---------- LEGACY FALLBACK (no/failed Tesseract) ----------
 def _legacy_extract(video_path: str, *, viz: bool, dx: int, dy: int, t: float) -> dict:
-    """
-    Original multi-frame extractor using extract_scoreboard_from_image with per-side voting.
-    """
     attempts: List[float] = [max(0.0, t + k*0.10) for k in range(5)]
     readings: List[Tuple[float, dict]] = []
     away_counts: Dict[int,int] = {}
@@ -356,8 +344,6 @@ def _legacy_extract(video_path: str, *, viz: bool, dx: int, dy: int, t: float) -
         if viz:
             draw_frame_crop_outline(str(frame_png), out_path=f"data/tmp/frame_with_scorebar_box_t{ts:.2f}.png")
         scorebar_png = crop_scorebar_from_frame(str(frame_png), out_path=f"data/tmp/scorebar_t{ts:.2f}.png")
-
-        # debug crops/boxes only on the last attempt
         debug_flag = viz and (idx == len(attempts) - 1)
         result = extract_scoreboard_from_image(str(scorebar_png),
                                                debug_crops=debug_flag,
@@ -419,7 +405,6 @@ def extract_scoreboard_from_video(
     use_fast = fast_ocr and (pytesseract is not None)
 
     if not use_fast:
-        # Proper fallback to original extractor (no stub)
         return _legacy_extract(video_path, viz=viz, dx=dx, dy=dy, t=t)
 
     stable_needed = 2
@@ -433,8 +418,8 @@ def extract_scoreboard_from_video(
     first_reading: Optional[dict] = None
     last_reading: Optional[dict] = None
 
-    global _SB_REF_OVERRIDE
-    _SB_REF_OVERRIDE = None
+    # Per-call reference (no globals)
+    ref = _RefSize()
 
     for idx, ts in enumerate(attempts):
         frame_png = grab_frame_at_time(video_path, ts, out_path=f"data/tmp/video_frame_t{ts:.2f}.png")
@@ -443,9 +428,13 @@ def extract_scoreboard_from_video(
         scorebar_png = crop_scorebar_from_frame(str(frame_png), out_path=f"data/tmp/scorebar_t{ts:.2f}.png")
 
         if viz and idx == 0:
-            _viz_px_rois(str(scorebar_png), out_base=f"data/tmp/scorebar_viz_t{ts:.2f}")
+            _viz_px_rois(str(scorebar_png), out_base=f"data/tmp/scorebar_viz_t{ts:.2f}", ref=ref)
 
-        fields = _extract_fields_fast_with_px_rois(str(scorebar_png))
+        try:
+            fields = _extract_fields_fast_with_px_rois(str(scorebar_png), ref=ref)
+        except Exception:
+            # If fast path throws for any reason (e.g., tesseract call), fall back gracefully
+            return _legacy_extract(video_path, viz=viz, dx=dx, dy=dy, t=t)
 
         if idx == 0:
             reading = {
