@@ -81,8 +81,9 @@ def build_llm_prompt(context: dict, transcript: str | None = None) -> str:
         f"{sys}\n"
         f"Sport: {sport}. Tone: {tone}. POV: {pov}. Target length: {length_hint}.\n"
         f"Bias guideline: {bias_rules}\n"
-        f"If team names are known, mention them naturally. Avoid profanity.\n\n"
+        f"If team names are known, mention them naturally. These are NFL Teams, going by at most three letter abbrieviation.\n\n"
         f"CONTEXT: {context}\n\n"
         f"TRANSCRIPT: {snippet}\n\n"
         f"Commentary:"
+        f"Be sure to explicitly mention all parameters in your response. Do not improvise."
     )
