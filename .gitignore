@@ -46,3 +46,5 @@ runs/
 *.pth
 *.onnx
 *.dylib
+
+madden_profile.json

@@ -1,5 +1,34 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import { staticUrl, runCommentaryFromVideo, getVoiceOptions, previewVoice } from "../lib/api";
+
+const BACKEND_MAP = {
+  neutral: {
+    male:   "tc_673eb45cdc1073aef51e6b90", // Dean
+    female: "tc_6412c42d733f60ab8ad369a9", // Caitlyn
+  },
+  radio: {
+    male:   "tc_6837b58f80ceeb17115bb771", // Walter
+    female: "tc_684a5a7ba2ce934624b59c6e", // Nia
+  },
+  hype: {
+    male:   "tc_623145940c2c1ff30c30f3a9", // Matthew
+    female: "tc_630494521f5003bebbfdafef", // Rachel
+  },
+};
+
+// Build reverse index: voice_id -> [{tone, gender}, ...]
+function computeReverseMap() {
+  const rev = {};
+  for (const tone of Object.keys(BACKEND_MAP)) {
+    for (const gender of Object.keys(BACKEND_MAP[tone])) {
+      const id = BACKEND_MAP[tone][gender];
+      if (!rev[id]) rev[id] = [];
+      rev[id].push({ tone, gender });
+    }
+  }
+  return rev;
+}
+const REVERSE_MAP = computeReverseMap();
 
 export default function Commentator() {
   const [file, setFile] = useState(null);
@@ -15,7 +44,17 @@ export default function Commentator() {
   const label = { display: "grid", gap: 6, fontSize: 12, color: "#374151", lineHeight: 1.25 };
   const input = { padding: 8, border: "1px solid #d1d5db", borderRadius: 6 };
 
-  // refresh voice list when tone/gender change
+  // decorate voices with mapping tags
+  const decoratedVoices = useMemo(() => {
+    return (voices || []).map(v => {
+      const mapped = (REVERSE_MAP[v.id] || [])
+        .map(m => `${m.tone}/${m.gender}`)
+        .join(", ");
+      return { ...v, mapped_for: mapped }; // e.g. "hype/male"
+    });
+  }, [voices]);
+
+  // refresh voice list when tone changes (API returns suggested_emotion keyed to current tone)
   useEffect(() => {
     (async () => {
       try {
@@ -46,7 +85,7 @@ export default function Commentator() {
       const data = await previewVoice({
         tone, bias, gender,
         voiceId: v.id,
-        emotion: v.suggested_emotion, // best for current tone
+        emotion: v.suggested_emotion,
         text: "Mic check. One-two.",
       });
       if (data.audio_url) setPreviewUrl(staticUrl(data.audio_url));
@@ -91,15 +130,24 @@ export default function Commentator() {
           </label>
         </div>
 
-        {/* Voice gallery: all six, with suggested emotion per current tone */}
+        {/* Voice gallery */}
         <div style={{ display: "grid", gap: 8 }}>
-          <div style={{ fontSize: 12, color: "#374151" }}>Voices (click Preview to audition):</div>
+          <div style={{ fontSize: 12, color: "#374151" }}>
+            Voices (click Preview to audition):
+          </div>
           <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}>
-            {voices.map(v => (
+            {decoratedVoices.map(v => (
               <div key={v.id} style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 10 }}>
                 <div style={{ fontWeight: 600 }}>{v.name}</div>
-                <div style={{ fontSize: 12, color: "#6b7280" }}>{v.gender} • {v.emotions.join(", ")}</div>
-                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>suggested: {v.suggested_emotion}</div>
+                <div style={{ fontSize: 12, color: "#6b7280" }}>
+                  {v.gender} • {v.emotions.join(", ")}
+                </div>
+                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>
+                  mapped for: {v.mapped_for || "—"}
+                </div>
+                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 2 }}>
+                  suggested: {v.suggested_emotion}
+                </div>
                 <button style={{ marginTop: 8 }} onClick={() => onPreviewSpecific(v)} disabled={loading}>
                   Preview
                 </button>
