@@ -27,8 +27,8 @@ SCOREBAR_BOX = (0, 1080, 2047, 1155)  # bottom banner in reference frame
 SB_ROIS_PX: Dict[str, Tuple[int, int, int, int]] = {
     "away_team":  (500,  0,  600,  50),
     "home_team":  (900,  0, 1000,  50),
-    "away_score": (655,  0,  745,  72),
-    "home_score": (765,  0,  855,  72),
+    "away_score": (655,  0,  745,  60),
+    "home_score": (765,  0,  855,  60),
     "quarter":    (1280, 20, 1335, 50),  # first digit only; we'll normalize to Q1..Q4
     "clock":      (1325, 20, 1445, 50),
 }
