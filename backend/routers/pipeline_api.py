@@ -57,6 +57,7 @@ def _safe_save_upload(upload: UploadFile, allow_exts: Iterable[str]) -> Path:
             pass
     return dest
 
+# ---------- Models ----------
 class CommentaryPrepResponse(BaseModel):
     context: Dict[str, Any]
     ocr: Dict[str, Any]
@@ -69,7 +70,7 @@ class CommentaryRunResponse(BaseModel):
     video_url: Optional[str] = None
     meta: Dict[str, Any]
 
-# ---------- Voice catalog & mapping (unchanged from your working version) ----------
+# ---------- Voice catalog & mapping ----------
 VOICE_CATALOG: List[Dict[str, Any]] = [
     {"id": "tc_673eb45cdc1073aef51e6b90", "name": "Dean",    "gender": "male",   "emotions": ["tonedown", "normal", "toneup"]},
     {"id": "tc_6412c42d733f60ab8ad369a9", "name": "Caitlyn", "gender": "female", "emotions": ["normal"]},
@@ -93,7 +94,8 @@ PREFERRED_BY_TONE = {
 
 def _pick_emotion(tone: str, supported: List[str]) -> str:
     for e in PREFERRED_BY_TONE.get(tone, ["normal"]):
-        if e in supported: return e
+        if e in supported:
+            return e
     return "normal"
 
 def _to_wav_from_mp3(mp3_path: Path) -> Path:
@@ -157,21 +159,26 @@ def voice_preview(
 def commentary_from_video(
     video: UploadFile = File(...),
     viz: bool = Form(False),
-    dx: int = Form(0),  # kept for compatibility
+    dx: int = Form(0),   # legacy compat
     dy: int = Form(0),
     t: float = Form(0.10),
+    scoreboard_type: Optional[str] = Form(None),  # "MNP" | "TNP" | "SNP" | None
     debug_prompt: Optional[int] = Query(None),
 ):
     dest = _safe_save_upload(video, VIDEO_EXTS)
     keep_uploads = os.getenv("KEEP_UPLOADS", "0") == "1"
     try:
-        ocr = extract_scoreboard_from_video_paddle(str(dest), t=t, attempts=3, viz=viz)
+        ocr = extract_scoreboard_from_video_paddle(
+            str(dest), t=t, attempts=3, viz=viz, profile_key=scoreboard_type
+        )
         ctx = ocr_to_commentary_context(ocr)
         return CommentaryPrepResponse(context=ctx, ocr=ocr, used_stub=bool(ocr.get("used_stub", False)))
     finally:
         if not keep_uploads:
-            try: dest.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 # ---------- Run ----------
 @router.post("/run-commentary-from-video", response_model=CommentaryRunResponse)
@@ -187,6 +194,7 @@ def run_commentary_from_video(
     audio_only: bool = Form(False),
     voice_id: Optional[str] = Form(None),
     emotion_preset: Optional[str] = Form(None),
+    scoreboard_type: Optional[str] = Form(None),  # "MNP" | "TNP" | "SNP" | None
     debug_prompt: Optional[int] = Query(None),
 ):
     dest = _safe_save_upload(video, VIDEO_EXTS)
@@ -194,11 +202,15 @@ def run_commentary_from_video(
     run_id = f"run_{uuid.uuid4().hex[:10]}"
 
     try:
-        # 1) OCR via PaddleOCR (with ROI viz if requested)
-        ocr = extract_scoreboard_from_video_paddle(str(dest), t=t, attempts=3, viz=viz)
+        # 1) OCR via PaddleOCR (override or auto-detect)
+        ocr = extract_scoreboard_from_video_paddle(
+            str(dest), t=t, attempts=3, viz=viz, profile_key=scoreboard_type
+        )
         ctx = ocr_to_commentary_context(ocr)
-        if tone: ctx["tone"] = tone
-        if bias: ctx["bias"] = bias
+        if tone:
+            ctx["tone"] = tone
+        if bias:
+            ctx["bias"] = bias
 
         tone_val = normalize_tone(str(ctx.get("tone", "neutral")))
         gender_val = (gender or "male").strip().lower()
@@ -209,19 +221,17 @@ def run_commentary_from_video(
         llm = get_llm()
         prompt = build_llm_prompt(ctx)
 
-        # Print to console if DEBUG_PROMPT=1
         if os.getenv("DEBUG_PROMPT", "0") == "1" or (debug_prompt and int(debug_prompt) == 1):
             print("\n=== LLM PROMPT (run_id:", run_id, ") ===\n")
             print(prompt)
             print("\n=== END PROMPT ===\n")
-            # also save to file
             out_dir = DATA_DIR / "tmp" / "prompts"
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / f"prompt_{run_id}.txt").write_text(prompt, encoding="utf-8")
 
         text = llm.generate(
             prompt,
-            meta={"tone": tone_val, "bias": str(ctx.get("bias","neutral")).lower(), "gender": gender_val},
+            meta={"tone": tone_val, "bias": str(ctx.get("bias", "neutral")).lower(), "gender": gender_val},
         )
 
         # 3) TTS selection
@@ -237,9 +247,12 @@ def run_commentary_from_video(
 
         tts = get_tts()
         audio_mp3_path = tts.synth_to_file(
-            text, DATA_DIR / "uploads" / "tts",
-            tone=tone_val, bias=str(ctx.get("bias","neutral")),
-            voice_id=voice_id, emotion_preset=emotion_preset,
+            text,
+            DATA_DIR / "uploads" / "tts",
+            tone=tone_val,
+            bias=str(ctx.get("bias", "neutral")),
+            voice_id=voice_id,
+            emotion_preset=emotion_preset,
         )  # type: ignore[arg-type]
         audio_mp3 = Path(audio_mp3_path)
 
@@ -249,6 +262,12 @@ def run_commentary_from_video(
             audio_wav = _to_wav_from_mp3(audio_mp3)
             vid_out_path = mux_audio_video(str(dest), str(audio_wav))
             video_out = Path(vid_out_path) if isinstance(vid_out_path, str) else vid_out_path
+
+        # Surface OCR extras (viz dir / preset) in meta if present
+        meta_extra: Dict[str, Any] = {}
+        for k in ("_viz_dir", "_preset"):
+            if isinstance(ocr.get(k), str):
+                meta_extra[k] = ocr[k]
 
         return CommentaryRunResponse(
             id=run_id,
@@ -266,7 +285,10 @@ def run_commentary_from_video(
                 "audio_only": audio_only,
                 "ocr_used_stub": bool(ocr.get("used_stub", False)),
                 "ocr_raw": ocr,
-                "prompt_file": f"/data/tmp/prompts/prompt_{run_id}.txt" if os.getenv("DEBUG_PROMPT","0")=="1" or (debug_prompt and int(debug_prompt)==1) else None,
+                "prompt_file": f"/data/tmp/prompts/prompt_{run_id}.txt"
+                    if os.getenv("DEBUG_PROMPT", "0") == "1" or (debug_prompt and int(debug_prompt) == 1)
+                    else None,
+                **meta_extra,
             },
         )
     except HTTPException:
@@ -275,5 +297,7 @@ def run_commentary_from_video(
         raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
     finally:
         if not keep_uploads:
-            try: dest.unlink(missing_ok=True)
-            except Exception: pass
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
