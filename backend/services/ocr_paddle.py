@@ -853,6 +853,22 @@ def _mode_int(values: List[Optional[int]]) -> Optional[int]:
     from collections import Counter
     return Counter(nums).most_common(1)[0][0]
 
+def _compose_legacy_score(
+    a_text: Optional[str],
+    h_text: Optional[str],
+    a_int: Optional[int],
+    h_int: Optional[int],
+) -> Optional[str]:
+    # Prefer the parsed ints if both are present
+    if a_int is not None and h_int is not None:
+        return f"{a_int}-{h_int}"
+    # Otherwise, try the raw texts if they both look like 1–2 digit numbers
+    at = (a_text or "").strip()
+    ht = (h_text or "").strip()
+    if re.fullmatch(r"\d{1,2}", at or "") and re.fullmatch(r"\d{1,2}", ht or ""):
+        return f"{int(at)}-{int(ht)}"
+    return None
+
 # ------------------------
 # Preset detection (top-right)
 # ------------------------
@@ -1126,6 +1142,10 @@ def extract_scoreboard_from_video_paddle(
     quarter_text = _mode_str(quarter_raw_reads)
     quarter = _mode_str(quarter_norm_reads)
 
+    legacy_score = _compose_legacy_score(
+        away_score_text, home_score_text, away_score_best, home_score_best
+    )
+
     result: Dict[str, Any] = {
         "away_team": away_team,
         "home_team": home_team,
@@ -1133,9 +1153,10 @@ def extract_scoreboard_from_video_paddle(
         "home_score_text": home_score_text,
         "away_score": away_score_best,
         "home_score": home_score_best,
+        "score": legacy_score,              # <— restore legacy combined field
         "clock": clk,
-        "quarter_text": quarter_text,  # raw (mode)
-        "quarter": quarter,            # normalized (mode)
+        "quarter_text": quarter_text,
+        "quarter": quarter,
         "used_stub": False,
         "_preset": chosen_preset,
     }
