@@ -60,14 +60,20 @@ ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
         "home_score": (825,   0,  950,  70),
         "quarter":    (1350, 15,  1410, 60),
         "clock":      (1410, 15,  1490, 60),
+        "down_dist":  (1675, 15,  1800, 60),
+        "yardline":   (1900, 15,  1950, 60),
+        "gameclock":  (1500, 15,  1550, 60),
     },
     "TNP": {
         "away_team":  (210,  25,  275,  75),
-        "away_score": (275,   5,  365,  75),  # tweaked y1
+        "away_score": (275,   5,  365,  75),
         "home_team":  (525,  25,  600,  75),
-        "home_score": (440,   5,  525,  75),  # tweaked y1
+        "home_score": (440,   5,  525,  75),
         "quarter":    (300,  75,  350, 120),
         "clock":      (350,  75,  450, 120),
+        "down_dist":  (175,  75,  300, 120),
+        "yardline":   (525,  75,  600, 120),
+        "gameclock":  (450,  75,  500, 120),
     },
     "SNP": {
         "away_team":  (130,  25,  205,  85),
@@ -76,6 +82,9 @@ ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
         "home_score": (570,  25,  660,  85),
         "quarter":    (340,  55,  375,  90),
         "clock":      (375,  55,  450,  90),
+        "down_dist":  (375,  20,  500,  50),
+        "yardline":   (485,  55,  525,  90),
+        "gameclock":  (450,  55,  485,  90),
     },
     "DEFAULT": {
         "away_team":  (375,   10,  465,  45),
@@ -84,6 +93,9 @@ ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
         "home_score": (575,   10,  645,  55),
         "quarter":    (960,   10, 1010,  45),
         "clock":      (1010,  10, 1090,  45),
+        "down_dist":  (1175,  10, 1325,  45),
+        "yardline":   (1350,  10, 1425,  45),
+        "gameclock":  (1100,  10, 1150,  45),
     },
 }
 
@@ -116,7 +128,7 @@ def _grab_frame(video_path: str, ts: float, out_png: Path) -> Path:
             ok, frame = cap.read()
             cap.release()
             if ok and frame is not None:
-                rgb = frame[:, :, ::-1]  # BGR->RGB
+                rgb = frame[:, :, ::-1]
                 Image.fromarray(rgb).save(out_png)
                 return out_png
     if _run_ffmpeg_grab(src, ts, out_png):
@@ -175,6 +187,9 @@ def _viz_rois_on_scorebar(scorebar_png: Path, ref_size: Tuple[int, int], roi_map
             "home_score": "lime",
             "quarter":    "deepskyblue",
             "clock":      "deepskyblue",
+            "down_dist":  "violet",
+            "yardline":   "violet",
+            "gameclock":  "deepskyblue",
         }
         for key, (x0, y0, x1, y1) in roi_map.items():
             X0, Y0 = int(round(x0 * sx)), int(round(y0 * sy))
@@ -312,6 +327,9 @@ def draw_roi_overlay(bar_canon: Any, skin: str, out_path: str) -> str:
         "home_score": "lime",
         "quarter":    "deepskyblue",
         "clock":      "deepskyblue",
+        "down_dist":  "violet",
+        "yardline":   "violet",
+        "gameclock":  "deepskyblue",
     }
 
     for key, (x1, y1, x2, y2) in roi_map.items():
@@ -720,66 +738,42 @@ def _sharpen(pil_img: Image.Image) -> Image.Image:
         return pil_img
 
 def _score_quarter_candidate(raw: str) -> float:
-    """
-    Heuristic score to choose best raw quarter text.
-    Prefers presence of 'Q' + [1-4], valid ordinal suffixes, or OT.
-    Penalizes very long strings.
-    """
     if not raw:
         return -1.0
     s = raw.strip().upper()
     s_nospace = re.sub(r"\s+", "", s)
     score = 0.0
-    if "OT" in s_nospace or s_nospace == "0T":
-        score += 4.0
-    if "Q" in s_nospace:
-        score += 2.5
-    if re.search(r"\b(?:1ST|2ND|3RD|4TH)\b", s):
-        score += 2.0
-    if re.search(r"\b[1-4]\b", s) or re.search(r"Q[ ]?[1-4]", s):
-        score += 2.0
-    # prefer short tokens
+    if "OT" in s_nospace or s_nospace == "0T": score += 4.0
+    if "Q" in s_nospace: score += 2.5
+    if re.search(r"\b(?:1ST|2ND|3RD|4TH)\b", s): score += 2.0
+    if re.search(r"\b[1-4]\b", s) or re.search(r"Q[ ]?[1-4]", s): score += 2.0
     score -= 0.05 * len(s_nospace)
     return score
 
 def _normalize_quarter(raw: str) -> Optional[str]:
     if not raw:
         return None
-    s = raw.strip().upper()
-    s = s.replace(" ", "")
-    # Most common canonical forms
+    s = raw.strip().upper().replace(" ", "")
     if s in {"Q1","Q2","Q3","Q4","OT"}:
         return s
-    # Ordinals
     if s in {"1ST","2ND","3RD","4TH"}:
         return {"1ST":"Q1","2ND":"Q2","3RD":"Q3","4TH":"Q4"}[s]
-    # Allow "Q" + digit and digit alone
     m = re.search(r"Q?([1-4])", s)
     if m:
         return f"Q{m.group(1)}"
-    # Common sloppy variants
-    if s in {"4T","4TH.", "Q4.", "Q-4"}:
-        return "Q4"
-    if s in {"OT.", "0T"}:
-        return "OT"
+    if s in {"4T","4TH.","Q4.","Q-4"}: return "Q4"
+    if s in {"OT.","0T"}: return "OT"
     return None
 
 def _ocr_quarter_ensemble(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optional[Path] = None, tag: str = "q") -> str:
-    """
-    Short-text OCR tuned for tiny 'Q1'..'Q4' / 'OT' strings.
-    """
     cands: List[Tuple[float, str]] = []
-
-    # Base variants
     bases: List[Image.Image] = []
     g = pil_img.convert("L")
     for sc in (2, 3, 4):
         bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
-    # CLAHE branch
     if cv2 is not None:
         g_np = np.array(g)
         bases.append(Image.fromarray(_clahe(g_np)))
-    # Light sharpen (helps faint thin glyphs)
     bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
 
     idx = 0
@@ -797,14 +791,12 @@ def _ocr_quarter_ensemble(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optiona
                 pass
         idx += 1
 
-    # Try direct, thresholded and polarity-picked versions
     for b in bases:
         add_candidate(b)
         for thr in (130, 160, 190):
             bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
             add_candidate(bw)
             add_candidate(ImageOps.invert(bw))
-        # polarity chooser on gray
         gray = np.array(b if b.mode == "L" else b.convert("L"))
         pol = _choose_polarity(gray)
         pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
@@ -815,10 +807,124 @@ def _ocr_quarter_ensemble(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optiona
     cands.sort(key=lambda t: t[0], reverse=True)
     return cands[0][1]
 
+# ---------- Down/Distance & Yardline OCR ensembles ----------
+def _score_down_dist_candidate(raw: str) -> float:
+    if not raw:
+        return -1.0
+    s = raw.strip().upper()
+    s = re.sub(r"[^A-Z0-9& ]", "", s)
+    score = 0.0
+    if re.search(r"\b(1ST|2ND|3RD|4TH|[1-4])\b", s): score += 3.0
+    if "&" in s or " AND " in f" {s} ": score += 2.0
+    if "GOAL" in s: score += 1.5
+    if re.search(r"\b\d{1,2}\b", s): score += 1.0
+    score -= 0.03 * len(s.replace(" ", ""))
+    return score
+
+def _ocr_down_dist_ensemble(ocr: PaddleOCR, pil_img: Image.Image,
+                            viz_dir: Optional[Path] = None, tag: str = "dd") -> str:
+    cands: List[Tuple[float, str]] = []
+    g = pil_img.convert("L")
+    bases: List[Image.Image] = []
+    for sc in (2, 3, 4):
+        bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
+    if cv2 is not None:
+        bases.append(Image.fromarray(_clahe(np.array(g))))
+    bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
+
+    idx = 0
+    def add(txt_img: Image.Image):
+        nonlocal idx
+        t = _ocr_text(ocr, txt_img if txt_img.mode == "RGB" else txt_img.convert("RGB"))
+        t = (t or "").strip()
+        if t:
+            cands.append((_score_down_dist_candidate(t), t))
+        if viz_dir:
+            try:
+                out = viz_dir / f"dd_ens_{tag}_{idx}.png"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                txt_img.convert("RGB").save(out)
+            except Exception: pass
+        idx += 1
+
+    for b in bases:
+        add(b)
+        for thr in (130, 160, 190, 205):
+            bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
+            add(bw); add(ImageOps.invert(bw))
+        gray = np.array(b if b.mode == "L" else b.convert("L"))
+        pol = _choose_polarity(gray)
+        pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
+        add(pol_rgb)
+
+    if not cands:
+        return ""
+    cands.sort(key=lambda x: x[0], reverse=True)
+    return cands[0][1]
+
+def _score_yardline_candidate(raw: str) -> float:
+    if not raw:
+        return -1.0
+    s = raw.strip().upper()
+    s = re.sub(r"[^A-Z0-9 ]", "", s)
+    score = 0.0
+    m = re.search(r"\b(50|[0-4]?\d)\b", s)
+    if m:
+        score += 3.0
+        val = int(m.group(1))
+        if 10 <= val <= 40: score += 0.5
+    if re.search(r"\b[A-Z]{2,4}\b", s):
+        score += 1.5
+    score -= 0.03 * len(s.replace(" ", ""))
+    return score
+
+def _ocr_yardline_ensemble(ocr: PaddleOCR, pil_img: Image.Image,
+                           viz_dir: Optional[Path] = None, tag: str = "yl") -> str:
+    cands: List[Tuple[float, str]] = []
+    g = pil_img.convert("L")
+    bases: List[Image.Image] = []
+    for sc in (2, 3, 4):
+        bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
+    if cv2 is not None:
+        bases.append(Image.fromarray(_clahe(np.array(g))))
+    bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
+
+    idx = 0
+    def add(txt_img: Image.Image):
+        nonlocal idx
+        t = _ocr_text(ocr, txt_img if txt_img.mode == "RGB" else txt_img.convert("RGB"))
+        t = (t or "").strip()
+        if t:
+            cands.append((_score_yardline_candidate(t), t))
+        if viz_dir:
+            try:
+                out = viz_dir / f"yl_ens_{tag}_{idx}.png"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                txt_img.convert("RGB").save(out)
+            except Exception: pass
+        idx += 1
+
+    for b in bases:
+        add(b)
+        for thr in (130, 160, 190, 205):
+            bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
+            add(bw); add(ImageOps.invert(bw))
+        gray = np.array(b if b.mode == "L" else b.convert("L"))
+        pol = _choose_polarity(gray)
+        pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
+        add(pol_rgb)
+
+    if not cands:
+        return ""
+    cands.sort(key=lambda x: x[0], reverse=True)
+    return cands[0][1]
+
 # ------------------------
 # Normalization + voting (common)
 # ------------------------
 _CLOCK_RX = re.compile(r"^\s*(\d{1,2}):([0-5]\d)\s*$", re.I)
+_DOWN_DIST_RX = re.compile(r"\b(1ST|2ND|3RD|4TH|\d)\s*(?:&|AND)\s*(GOAL|\d{1,2})\b", re.I)
+_YARDLINE_RX = re.compile(r"\b([A-Z]{2,4})?\s*(50|[0-4]?\d)\b", re.I)
 
 def _norm_team(s: str) -> Optional[str]:
     s = (s or "").strip()
@@ -838,6 +944,39 @@ def _norm_clock(s: str) -> Optional[str]:
     if m:
         return f"{int(m.group(1))}:{m.group(2)}"
     return None
+
+def _parse_down_distance(s: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    if not s:
+        return (None, None, None)
+    t = re.sub(r"[^A-Za-z0-9& ]", "", s.upper()).strip()
+    m = _DOWN_DIST_RX.search(t)
+    if not m:
+        m2 = re.search(r"\b([1234])\s*(?:&|AND)\s*(GOAL|\d{1,2})\b", t)
+        if not m2:
+            return (None, None, None)
+        g1, g2 = m2.group(1), m2.group(2)
+        down = int(g1)
+        if g2 == "GOAL":
+            return (down, None, "GOAL")
+        return (down, int(g2), g2)
+    g1, g2 = m.group(1), m.group(2)
+    down_map = {"1ST":1,"2ND":2,"3RD":3,"4TH":4}
+    down = down_map.get(g1, None) if not g1.isdigit() else int(g1)
+    if g2 == "GOAL":
+        return (down, None, "GOAL")
+    return (down, int(g2), g2)
+
+def _parse_yardline(s: str) -> tuple[Optional[str], Optional[int]]:
+    if not s:
+        return (None, None)
+    t = re.sub(r"[^A-Za-z0-9 ]", "", s.upper()).strip()
+    m = _YARDLINE_RX.search(t)
+    if not m:
+        return (None, None)
+    side = (m.group(1) or "").strip() or None
+    y = int(m.group(2))
+    y = max(0, min(50, y))
+    return (side, y)
 
 def _mode_str(values: List[Optional[str]]) -> Optional[str]:
     vals = [v for v in values if v]
@@ -859,10 +998,8 @@ def _compose_legacy_score(
     a_int: Optional[int],
     h_int: Optional[int],
 ) -> Optional[str]:
-    # Prefer the parsed ints if both are present
     if a_int is not None and h_int is not None:
         return f"{a_int}-{h_int}"
-    # Otherwise, try the raw texts if they both look like 1–2 digit numbers
     at = (a_text or "").strip()
     ht = (h_text or "").strip()
     if re.fullmatch(r"\d{1,2}", at or "") and re.fullmatch(r"\d{1,2}", ht or ""):
@@ -913,7 +1050,7 @@ def extract_scoreboard_from_video_paddle(
     Canonical crop → resize → pixel-ROI → OCR:
       * Robust score reading (with targeted TNP-away rescue).
       * Quarter: specialized ensemble and normalization; larger ROI padding.
-      * Both raw (`quarter_text`) and normalized (`quarter`) returned.
+      * Down/Distance & Yardline: ensemble OCR + parse + mode voting.
     """
     run_id = f"ocr_{uuid.uuid4().hex[:8]}"
     run_dir = Path("data/tmp/ocr") / run_id
@@ -933,6 +1070,13 @@ def extract_scoreboard_from_video_paddle(
     clock_reads: List[Optional[str]] = []
     quarter_raw_reads: List[Optional[str]] = []
     quarter_norm_reads: List[Optional[str]] = []
+    # NEW: down/distance + yardline + optional gameclock
+    down_reads: List[Optional[int]] = []
+    distance_reads: List[Optional[int]] = []
+    distance_text_reads: List[Optional[str]] = []
+    yard_side_reads: List[Optional[str]] = []
+    yardline_reads: List[Optional[int]] = []
+    game_clock_reads: List[Optional[str]] = []
 
     # --- Rescue helper (TNP-away only) ---
     def _rescue_read_digits_for_tnp_away(patch_np: np.ndarray) -> Tuple[Optional[str], Optional[int], bool]:
@@ -993,8 +1137,13 @@ def extract_scoreboard_from_video_paddle(
             Image.fromarray(sb_canon).save(run_dir / f"scorebar_canonical_{chosen_preset}_t{ts:.2f}.png")
             draw_roi_overlay(sb_canon, chosen_preset, str(run_dir / f"scorebar_overlay_{chosen_preset}_t{ts:.2f}.png"))
 
-        # quarter gets a bit more padding
-        patches = extract_rois(sb_canon, chosen_preset, pad=2, roi_pad_overrides={"quarter": 4})
+        # quarter gets a bit more padding; also pad new fields a touch
+        patches = extract_rois(
+            sb_canon,
+            chosen_preset,
+            pad=2,
+            roi_pad_overrides={"quarter": 4, "down_dist": 3, "yardline": 3, "gameclock": 3}
+        )
 
         def ocr_roi(name: str) -> str:
             patch = patches.get(name)
@@ -1010,7 +1159,7 @@ def extract_scoreboard_from_video_paddle(
         a_sc_patch = patches.get("away_score")
         h_sc_patch = patches.get("home_score")
 
-        # -------- primary score reader (unchanged) --------
+        # -------- primary score reader --------
         def read_score_patch(patch_np: Optional[np.ndarray], tag: str) -> Tuple[Optional[str], Optional[int]]:
             if patch_np is None:
                 return None, None
@@ -1081,7 +1230,6 @@ def extract_scoreboard_from_video_paddle(
         a_sc_text, a_sc_int = read_score_patch(a_sc_patch, "away")
         h_sc_text, h_sc_int = read_score_patch(h_sc_patch, "home")
 
-        # targeted rescue for TNP-away if missed
         if chosen_preset == "TNP" and (a_sc_text is None or a_sc_text == "") and a_sc_patch is not None:
             r_text, r_int, r_zero_hint = _rescue_read_digits_for_tnp_away(a_sc_patch)
             if r_text is not None or r_int is not None:
@@ -1096,34 +1244,62 @@ def extract_scoreboard_from_video_paddle(
         q_norm_best: Optional[str] = None
         if q_patch is not None:
             q_pil = Image.fromarray(q_patch)
-            # ensemble
             q_raw_candidate = _ocr_quarter_ensemble(ocr, q_pil, viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}")
-            # also try a simple threshold as a backup
             q_raw_simple = _ocr_text(ocr, _prep_gray_bw(q_pil, 160, False))
-            # choose better by heuristic
             cand_list = [(q_raw_candidate or ""), (q_raw_simple or "")]
             cand_scored = sorted((( _score_quarter_candidate(c), c) for c in cand_list if c), reverse=True)
             if cand_scored:
                 q_raw_best = cand_scored[0][1]
                 q_norm_best = _normalize_quarter(q_raw_best)
 
-        # clock (unchanged)
+        # clock(s)
         c_raw = ocr_roi("clock")
+        gc_raw = ocr_roi("gameclock")
+        clk_norm = _norm_clock(gc_raw) or _norm_clock(c_raw)
+
+        # NEW: down & distance + yardline via ensembles
+        dd_raw = ""
+        if patches.get("down_dist") is not None:
+            dd_raw = _ocr_down_dist_ensemble(
+                ocr, Image.fromarray(patches["down_dist"]),
+                viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}"
+            )
+        yl_raw = ""
+        if patches.get("yardline") is not None:
+            yl_raw = _ocr_yardline_ensemble(
+                ocr, Image.fromarray(patches["yardline"]),
+                viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}"
+            )
 
         # collect per-frame reads
         away_team_reads.append(_norm_team(a_team_raw))
         home_team_reads.append(_norm_team(h_team_raw))
-
         away_score_text_reads.append(a_sc_text)
         home_score_text_reads.append(h_sc_text)
         away_score_int_reads.append(a_sc_int)
         home_score_int_reads.append(h_sc_int)
-
-        clock_reads.append(_norm_clock(c_raw))
+        clock_reads.append(clk_norm)
+        game_clock_reads.append(_norm_clock(gc_raw) if gc_raw else None)
         quarter_raw_reads.append((q_raw_best or "").strip() or None)
         quarter_norm_reads.append(q_norm_best)
 
-        # optional debug
+        # parse and store down/distance
+        if dd_raw:
+            dwn, dist, dist_txt = _parse_down_distance(dd_raw)
+            down_reads.append(dwn)
+            distance_reads.append(dist)
+            distance_text_reads.append(dist_txt or (str(dist) if dist is not None else None))
+        else:
+            down_reads.append(None); distance_reads.append(None); distance_text_reads.append(None)
+
+        # parse and store yardline
+        if yl_raw:
+            yside, yline = _parse_yardline(yl_raw)
+            yard_side_reads.append(yside)
+            yardline_reads.append(yline)
+        else:
+            yard_side_reads.append(None); yardline_reads.append(None)
+
         if viz and q_patch is not None and q_raw_best:
             try:
                 Image.fromarray(q_patch).save(run_dir / f"quarter_patch_t{ts:.2f}.png")
@@ -1142,6 +1318,13 @@ def extract_scoreboard_from_video_paddle(
     quarter_text = _mode_str(quarter_raw_reads)
     quarter = _mode_str(quarter_norm_reads)
 
+    # NEW aggregates
+    down_best = _mode_int(down_reads)
+    distance_best = _mode_int(distance_reads)
+    distance_text_best = _mode_str(distance_text_reads)
+    yard_side_best = _mode_str(yard_side_reads)
+    yardline_best = _mode_int(yardline_reads)
+
     legacy_score = _compose_legacy_score(
         away_score_text, home_score_text, away_score_best, home_score_best
     )
@@ -1153,10 +1336,16 @@ def extract_scoreboard_from_video_paddle(
         "home_score_text": home_score_text,
         "away_score": away_score_best,
         "home_score": home_score_best,
-        "score": legacy_score,              # <— restore legacy combined field
-        "clock": clk,
+        "score": legacy_score,
+        "clock": clk,                       # prefers 'gameclock' if valid earlier
         "quarter_text": quarter_text,
         "quarter": quarter,
+        # NEW fields
+        "down": down_best,
+        "distance": distance_best,              # None when Goal
+        "distance_text": distance_text_best,    # "10" or "GOAL"
+        "yardline_side": yard_side_best,        # e.g., "BUF"
+        "yardline": yardline_best,              # 0..50
         "used_stub": False,
         "_preset": chosen_preset,
     }
@@ -1171,6 +1360,9 @@ def extract_scoreboard_from_video_paddle(
         clk,
         quarter_text,
         quarter,
+        down_best,
+        distance_best,
+        yardline_best,
     )):
         return {"used_stub": True, "_preset": chosen_preset}
 
