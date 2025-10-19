@@ -49,6 +49,10 @@ async def analyze_commentate(
     score: str | None = Form(default=None),
     quarter: str | None = Form(default=None),
     clock: str | None = Form(default=None),
+    down: int | None = Form(default=None),
+    distance: int | None = Form(default=None),
+    distance_text: str | None = Form(default=None),
+    yardline: int | None = Form(default=None),
     tone: str = Form(default="play-by-play"),
     bias: str = Form(default="neutral"),                # NEW: neutral | home | away
     voice: str = Form(default="default"),
@@ -79,6 +83,10 @@ async def analyze_commentate(
         "score": score,
         "quarter": quarter,
         "clock": clock,
+        "down": down,
+        "distance": distance,
+        "distance_text": distance_text,
+        "yardline": yardline,
         "tone": tone,
         "bias": bias,  # NEW: threaded through to the prompt builder
     }
