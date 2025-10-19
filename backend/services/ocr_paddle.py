@@ -265,8 +265,12 @@ def extract_rois(
     bar_canon: Any,
     skin: str,
     roi_names: Optional[List[str]] = None,
-    pad: int = 2
+    pad: int = 2,
+    roi_pad_overrides: Optional[Dict[str, int]] = None,
 ) -> Dict[str, np.ndarray]:
+    """
+    Extract canonical ROIs. Uses default ±pad, with optional per-ROI overrides.
+    """
     t0 = time.perf_counter()
     skin = (skin or "DEFAULT").upper()
     roi_map = ROI_PRESETS_CANON.get(skin) or ROI_PRESETS_CANON["DEFAULT"]
@@ -276,13 +280,15 @@ def extract_rois(
 
     names = roi_names if roi_names else list(roi_map.keys())
     patches: Dict[str, np.ndarray] = {}
+    roi_pad_overrides = roi_pad_overrides or {}
 
     for name in names:
         if name not in roi_map:
             continue
         x1, y1, x2, y2 = roi_map[name]
-        x1p = x1 - pad; y1p = y1 - pad
-        x2p = x2 + pad; y2p = y2 + pad
+        my_pad = roi_pad_overrides.get(name, pad)
+        x1p = x1 - my_pad; y1p = y1 - my_pad
+        x2p = x2 + my_pad; y2p = y2 + my_pad
         x1p, y1p, x2p, y2p = _clamp_box_exclusive((x1p, y1p, x2p, y2p), W, H)
         patch = img[y1p:y2p, x1p:x2p, :].copy()
         patches[name] = patch
@@ -363,7 +369,7 @@ def _ocr_letters_strict(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optional[
     return cand[0][1]
 
 # ------------------------
-# Digit OCR (ensemble) + confidences
+# Digit OCR (ensemble) + confidences (scores)
 # ------------------------
 def _only_digits(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
@@ -381,11 +387,6 @@ def _ocr_digits_ensemble(
     tag: str = "",
     extra_images: Optional[List[Image.Image]] = None
 ) -> str:
-    """
-    Multi-scale, multi-threshold (+/- invert), plus a CLAHE branch.
-    Chooses longest digit string; tie-breaker prefers non-inverted.
-    extra_images: optional preprocessed variants to include.
-    """
     cands: List[Tuple[int, str]] = []
     idx = 0
     bases: List[Image.Image] = []
@@ -478,10 +479,6 @@ def _resize_like(img: np.ndarray, target_hw: Sequence[int]) -> np.ndarray:
     return cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
 
 def _best_split_index(bw: np.ndarray) -> int:
-    """
-    Find the vertical seam (between 30%..70% of width) with minimal dark pixel count;
-    helps separate two digits like '10'/'24'.
-    """
     H, W = bw.shape
     fg = (bw < 128).astype(np.uint8)
     col_sums = fg.sum(axis=0)
@@ -494,10 +491,6 @@ def _best_split_index(bw: np.ndarray) -> int:
     return lo + idx
 
 def _template_match_digits_with_conf(pil_img: Image.Image, skin: str, max_digits: int = 2) -> Optional[Tuple[str, float]]:
-    """
-    NCC template match; returns (digits, confidence in [0,1]).
-    For 2 digits, searches best seam instead of fixed 50/50 split.
-    """
     tpls = _load_digit_templates(skin)
     if not tpls:
         return None
@@ -539,13 +532,11 @@ def _template_match_digits_with_conf(pil_img: Image.Image, skin: str, max_digits
 
 # ---------- Polarity/illumination helpers ----------
 def _illumination_normalize(gray: np.ndarray) -> np.ndarray:
-    """Divide by blurred field to flatten shading; clip to 0..255."""
     if cv2 is not None:
         blur = cv2.GaussianBlur(gray, (11, 11), 3)
         norm = (gray.astype(np.float32) / (blur.astype(np.float32) + 1e-6)) * 128.0
         norm = np.clip(norm, 0, 255).astype(np.uint8)
         return norm
-    # PIL fallback
     pil = Image.fromarray(gray)
     blur = np.array(pil.filter(ImageFilter.GaussianBlur(radius=3)))
     norm = (gray.astype(np.float32) / (blur.astype(np.float32) + 1e-6)) * 128.0
@@ -568,7 +559,6 @@ def _central_occupancy(bw: np.ndarray) -> float:
     return float(fg) / float(roi.size)
 
 def _choose_polarity(gray: np.ndarray) -> np.ndarray:
-    """Return the binary image (normal or inverted) with higher edge+occupancy score."""
     variants = _prep_binary_variants_gray(gray)
     best_score = -1.0
     best = variants[0]
@@ -581,31 +571,23 @@ def _choose_polarity(gray: np.ndarray) -> np.ndarray:
     return best
 
 def _best_subwindow_by_edge(patch_rgb: np.ndarray, max_shift: int = 2) -> Image.Image:
-    """Try small shifts, keep window with highest edge energy, return resized back to original size."""
     H, W, _ = patch_rgb.shape
     best_score = -1.0
     best_crop = patch_rgb
     for dy in (-max_shift, 0, max_shift):
         for dx in (-max_shift, 0, max_shift):
-            y0 = max(0, 0 + dy); y1 = min(H, H + dy)
-            x0 = max(0, 0 + dx); x1 = min(W, W + dx)
-            if y1 - y0 < H - abs(dy) or x1 - x0 < W - abs(dx):
-                # ensure we keep inside bounds
-                y0 = max(0, dy if dy > 0 else 0)
-                x0 = max(0, dx if dx > 0 else 0)
-                y1 = min(H, H + (dy if dy < 0 else 0))
-                x1 = min(W, W + (dx if dx < 0 else 0))
+            y0 = max(0, dy if dy > 0 else 0)
+            x0 = max(0, dx if dx > 0 else 0)
+            y1 = min(H, H + (dy if dy < 0 else 0))
+            x1 = min(W, W + (dx if dx < 0 else 0))
             crop = patch_rgb[y0:y1, x0:x1]
             if crop.size == 0:
                 continue
-            if cv2 is not None:
-                score = _edge_energy(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY))
-            else:
-                score = _edge_energy(np.array(Image.fromarray(crop).convert("L")))
+            g = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if cv2 is not None else np.array(Image.fromarray(crop).convert("L"))
+            score = _edge_energy(g)
             if score > best_score:
                 best_score = score
                 best_crop = crop
-    # resize back to original size
     if cv2 is not None:
         resized = cv2.resize(best_crop, (W, H), interpolation=cv2.INTER_AREA)
         return Image.fromarray(resized)
@@ -721,7 +703,6 @@ def _zero_center_contrast_conf(pil_img: Image.Image) -> float:
     return 0.6 * dens_score + 0.4 * bright_score
 
 def _count_connected_components(bw: np.ndarray) -> int:
-    """Count foreground components in a binary image where foreground is dark (0)."""
     if cv2 is None:
         cols = (bw < 128).sum(axis=0) > 0
         return int(max(1, np.diff(cols.astype(np.int32)).clip(min=0).sum()))
@@ -730,7 +711,112 @@ def _count_connected_components(bw: np.ndarray) -> int:
     return max(0, num_labels - 1)
 
 # ------------------------
-# Normalization + voting
+# Quarter OCR helpers
+# ------------------------
+def _sharpen(pil_img: Image.Image) -> Image.Image:
+    try:
+        return pil_img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
+    except Exception:
+        return pil_img
+
+def _score_quarter_candidate(raw: str) -> float:
+    """
+    Heuristic score to choose best raw quarter text.
+    Prefers presence of 'Q' + [1-4], valid ordinal suffixes, or OT.
+    Penalizes very long strings.
+    """
+    if not raw:
+        return -1.0
+    s = raw.strip().upper()
+    s_nospace = re.sub(r"\s+", "", s)
+    score = 0.0
+    if "OT" in s_nospace or s_nospace == "0T":
+        score += 4.0
+    if "Q" in s_nospace:
+        score += 2.5
+    if re.search(r"\b(?:1ST|2ND|3RD|4TH)\b", s):
+        score += 2.0
+    if re.search(r"\b[1-4]\b", s) or re.search(r"Q[ ]?[1-4]", s):
+        score += 2.0
+    # prefer short tokens
+    score -= 0.05 * len(s_nospace)
+    return score
+
+def _normalize_quarter(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    s = raw.strip().upper()
+    s = s.replace(" ", "")
+    # Most common canonical forms
+    if s in {"Q1","Q2","Q3","Q4","OT"}:
+        return s
+    # Ordinals
+    if s in {"1ST","2ND","3RD","4TH"}:
+        return {"1ST":"Q1","2ND":"Q2","3RD":"Q3","4TH":"Q4"}[s]
+    # Allow "Q" + digit and digit alone
+    m = re.search(r"Q?([1-4])", s)
+    if m:
+        return f"Q{m.group(1)}"
+    # Common sloppy variants
+    if s in {"4T","4TH.", "Q4.", "Q-4"}:
+        return "Q4"
+    if s in {"OT.", "0T"}:
+        return "OT"
+    return None
+
+def _ocr_quarter_ensemble(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optional[Path] = None, tag: str = "q") -> str:
+    """
+    Short-text OCR tuned for tiny 'Q1'..'Q4' / 'OT' strings.
+    """
+    cands: List[Tuple[float, str]] = []
+
+    # Base variants
+    bases: List[Image.Image] = []
+    g = pil_img.convert("L")
+    for sc in (2, 3, 4):
+        bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
+    # CLAHE branch
+    if cv2 is not None:
+        g_np = np.array(g)
+        bases.append(Image.fromarray(_clahe(g_np)))
+    # Light sharpen (helps faint thin glyphs)
+    bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
+
+    idx = 0
+    def add_candidate(img_like: Image.Image):
+        nonlocal idx
+        txt = _ocr_text(ocr, img_like if img_like.mode == "RGB" else img_like.convert("RGB"))
+        txt = (txt or "").strip()
+        if txt:
+            cands.append((_score_quarter_candidate(txt), txt))
+        if viz_dir:
+            try:
+                (viz_dir / f"quarter_ens_{tag}_{idx}.png").parent.mkdir(parents=True, exist_ok=True)
+                img_like.convert("RGB").save(viz_dir / f"quarter_ens_{tag}_{idx}.png")
+            except Exception:
+                pass
+        idx += 1
+
+    # Try direct, thresholded and polarity-picked versions
+    for b in bases:
+        add_candidate(b)
+        for thr in (130, 160, 190):
+            bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
+            add_candidate(bw)
+            add_candidate(ImageOps.invert(bw))
+        # polarity chooser on gray
+        gray = np.array(b if b.mode == "L" else b.convert("L"))
+        pol = _choose_polarity(gray)
+        pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
+        add_candidate(pol_rgb)
+
+    if not cands:
+        return ""
+    cands.sort(key=lambda t: t[0], reverse=True)
+    return cands[0][1]
+
+# ------------------------
+# Normalization + voting (common)
 # ------------------------
 _CLOCK_RX = re.compile(r"^\s*(\d{1,2}):([0-5]\d)\s*$", re.I)
 
@@ -809,11 +895,9 @@ def extract_scoreboard_from_video_paddle(
 ) -> Dict[str, Any]:
     """
     Canonical crop → resize → pixel-ROI → OCR:
-      * Individual team scores (raw + parsed).
-      * Quarter returned raw.
-      * Score reading uses OCR ensemble + zero/center/seven/template confidences with safer thresholds.
-      * Template split is learned seam (better 2-digit like '10', '24').
-      * Targeted rescue path only for TNP-away (darker ROI).
+      * Robust score reading (with targeted TNP-away rescue).
+      * Quarter: specialized ensemble and normalization; larger ROI padding.
+      * Both raw (`quarter_text`) and normalized (`quarter`) returned.
     """
     run_id = f"ocr_{uuid.uuid4().hex[:8]}"
     run_dir = Path("data/tmp/ocr") / run_id
@@ -832,56 +916,39 @@ def extract_scoreboard_from_video_paddle(
     home_score_int_reads: List[Optional[int]] = []
     clock_reads: List[Optional[str]] = []
     quarter_raw_reads: List[Optional[str]] = []
+    quarter_norm_reads: List[Optional[str]] = []
 
     # --- Rescue helper (TNP-away only) ---
     def _rescue_read_digits_for_tnp_away(patch_np: np.ndarray) -> Tuple[Optional[str], Optional[int], bool]:
-        """
-        Returns (text, int, zero_hint). zero_hint=True if geometric zero is moderately likely.
-        Runs only when primary pass returned empty text for TNP-away.
-        """
-        # Illumination normalization
         gray = np.array(Image.fromarray(patch_np).convert("L"))
         norm = _illumination_normalize(gray)
         norm = _clahe(norm)
-
-        # Polarity pick
         best_bw = _choose_polarity(norm)
 
-        # Compose extra candidates for the ensemble (RGB)
         extra_imgs: List[Image.Image] = []
         extra_imgs.append(Image.fromarray(cv2.cvtColor(norm, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([norm]*3, -1)))
         extra_imgs.append(Image.fromarray(cv2.cvtColor(best_bw, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([best_bw]*3, -1)))
-
-        # Micro-ROI nudge: try tiny subwindow with more edges
         nudged = _best_subwindow_by_edge(patch_np, max_shift=2)
         extra_imgs.append(nudged)
-
-        # A slightly heavier single-path upscale for this ROI
         big = Image.fromarray(patch_np).resize(
             (patch_np.shape[1]*5, patch_np.shape[0]*5),
             resample=Image.Resampling.BICUBIC
         )
         extra_imgs.append(big)
 
-        # Ensemble with extras
         dg = _ocr_digits_ensemble(ocr, Image.fromarray(patch_np), viz_dir=(run_dir if viz else None), tag="tnp_away_rescue", extra_images=extra_imgs)
         dg = (dg or "").strip()
 
-        # Template match with slightly relaxed 0 acceptance coupled to geometry
         tpl = _template_match_digits_with_conf(Image.fromarray(patch_np), "TNP", max_digits=2)
         tpl_guess, tpl_conf = (tpl[0], tpl[1]) if tpl else (None, 0.0)
 
-        # Zero geometry hints
         z_conf  = _detect_zero_confidence(Image.fromarray(patch_np))
         zc2     = _zero_center_contrast_conf(Image.fromarray(patch_np))
         zero_hint = (z_conf >= 0.58) or ((z_conf >= 0.52) and (zc2 >= 0.58))
 
-        # If still empty, consider template "0" if geometry agrees
         if not dg:
             if tpl_guess == "0" and tpl_conf >= 0.46 and zero_hint:
                 dg = "0"
-
-        # If still empty and zero_hint strong, set int 0 but leave text None
         if not dg and zero_hint:
             return None, 0, True
 
@@ -910,7 +977,8 @@ def extract_scoreboard_from_video_paddle(
             Image.fromarray(sb_canon).save(run_dir / f"scorebar_canonical_{chosen_preset}_t{ts:.2f}.png")
             draw_roi_overlay(sb_canon, chosen_preset, str(run_dir / f"scorebar_overlay_{chosen_preset}_t{ts:.2f}.png"))
 
-        patches = extract_rois(sb_canon, chosen_preset, pad=2)
+        # quarter gets a bit more padding
+        patches = extract_rois(sb_canon, chosen_preset, pad=2, roi_pad_overrides={"quarter": 4})
 
         def ocr_roi(name: str) -> str:
             patch = patches.get(name)
@@ -926,7 +994,7 @@ def extract_scoreboard_from_video_paddle(
         a_sc_patch = patches.get("away_score")
         h_sc_patch = patches.get("home_score")
 
-        # -------- primary score reader (same as before) --------
+        # -------- primary score reader (unchanged) --------
         def read_score_patch(patch_np: Optional[np.ndarray], tag: str) -> Tuple[Optional[str], Optional[int]]:
             if patch_np is None:
                 return None, None
@@ -957,7 +1025,6 @@ def extract_scoreboard_from_video_paddle(
                 cc_counts.append(_count_connected_components(bw if bw.mean() > 127 else (255 - bw)))
             cc = int(np.median(cc_counts)) if cc_counts else 1
 
-            # Skin-specific thresholds
             is_SNP = (chosen_preset == "SNP")
             SEVEN_STRONG = 0.58 if is_SNP else 0.65
             SEVEN_TPL    = 0.38 if is_SNP else 0.40
@@ -966,7 +1033,6 @@ def extract_scoreboard_from_video_paddle(
             ZERO_TPL     = 0.52 if is_SNP else 0.55
             TPL_2DIG     = 0.48 if is_SNP else 0.50
 
-            # ZERO handling (safe; never override ≥2 digits)
             strong_zero = (z_conf >= ZERO_STRONG) or ((z_conf >= ZERO_PAIR) and (zc2 >= ZERO_PAIR))
             tpl_zero_ok = (tpl_guess == "0" and tpl_conf >= ZERO_TPL)
 
@@ -977,7 +1043,6 @@ def extract_scoreboard_from_video_paddle(
                 if strong_zero:
                     dg = "0"
 
-            # Seven vs one
             if (not dg) or (dg == "1"):
                 if s_conf >= SEVEN_STRONG:
                     dg = "7"
@@ -987,7 +1052,6 @@ def extract_scoreboard_from_video_paddle(
                     if fg_ratio >= 0.33 and tpl_guess:
                         dg = tpl_guess
 
-            # Two-digit rescue (e.g., '10','24')
             if (not dg) or (len(dg) == 1):
                 if tpl_guess and len(tpl_guess) == 2 and tpl_conf >= TPL_2DIG:
                     if (aspect >= 0.90) or (cc >= 2):
@@ -1001,19 +1065,36 @@ def extract_scoreboard_from_video_paddle(
         a_sc_text, a_sc_int = read_score_patch(a_sc_patch, "away")
         h_sc_text, h_sc_int = read_score_patch(h_sc_patch, "home")
 
-        # -------- targeted rescue for TNP-away if missed --------
+        # targeted rescue for TNP-away if missed
         if chosen_preset == "TNP" and (a_sc_text is None or a_sc_text == "") and a_sc_patch is not None:
             r_text, r_int, r_zero_hint = _rescue_read_digits_for_tnp_away(a_sc_patch)
             if r_text is not None or r_int is not None:
                 a_sc_text = r_text if r_text is not None else a_sc_text
                 a_sc_int = r_int if r_int is not None else a_sc_int
             elif r_zero_hint and a_sc_int is None:
-                # gentle null->0 mapping ONLY for TNP-away, when geometry suggests zero
                 a_sc_int = 0
 
-        q_raw = ocr_roi("quarter")
+        # -------- quarter (specialized ensemble + normalization) --------
+        q_patch = patches.get("quarter")
+        q_raw_best: Optional[str] = None
+        q_norm_best: Optional[str] = None
+        if q_patch is not None:
+            q_pil = Image.fromarray(q_patch)
+            # ensemble
+            q_raw_candidate = _ocr_quarter_ensemble(ocr, q_pil, viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}")
+            # also try a simple threshold as a backup
+            q_raw_simple = _ocr_text(ocr, _prep_gray_bw(q_pil, 160, False))
+            # choose better by heuristic
+            cand_list = [(q_raw_candidate or ""), (q_raw_simple or "")]
+            cand_scored = sorted((( _score_quarter_candidate(c), c) for c in cand_list if c), reverse=True)
+            if cand_scored:
+                q_raw_best = cand_scored[0][1]
+                q_norm_best = _normalize_quarter(q_raw_best)
+
+        # clock (unchanged)
         c_raw = ocr_roi("clock")
 
+        # collect per-frame reads
         away_team_reads.append(_norm_team(a_team_raw))
         home_team_reads.append(_norm_team(h_team_raw))
 
@@ -1023,29 +1104,27 @@ def extract_scoreboard_from_video_paddle(
         home_score_int_reads.append(h_sc_int)
 
         clock_reads.append(_norm_clock(c_raw))
-        quarter_raw_reads.append((q_raw or "").strip() or None)
+        quarter_raw_reads.append((q_raw_best or "").strip() or None)
+        quarter_norm_reads.append(q_norm_best)
 
-        # Optional instrumentation dump if TNP-away still null
-        if viz and chosen_preset == "TNP" and (a_sc_text is None) and a_sc_patch is not None:
-            p = Path(run_dir) / f"tnp_away_debug_t{ts:.2f}.png"
-            Image.fromarray(a_sc_patch).save(p)
-            gray = np.array(Image.fromarray(a_sc_patch).convert("L"))
-            best_bw = _choose_polarity(gray)
-            Image.fromarray(best_bw).save(Path(run_dir) / f"tnp_away_debug_bestbw_t{ts:.2f}.png")
+        # optional debug
+        if viz and q_patch is not None and q_raw_best:
+            try:
+                Image.fromarray(q_patch).save(run_dir / f"quarter_patch_t{ts:.2f}.png")
+            except Exception:
+                pass
 
     # Aggregate across frames
     away_team = _mode_str(away_team_reads)
     home_team = _mode_str(home_team_reads)
-
     away_score_text = _mode_str(away_score_text_reads)
     home_score_text = _mode_str(home_score_text_reads)
-
     away_score_best = _mode_int(away_score_int_reads)
     home_score_best = _mode_int(home_score_int_reads)
-
     clk = _mode_str(clock_reads)
+
     quarter_text = _mode_str(quarter_raw_reads)
-    qtr = quarter_text  # passthrough for now
+    quarter = _mode_str(quarter_norm_reads)
 
     result: Dict[str, Any] = {
         "away_team": away_team,
@@ -1055,13 +1134,13 @@ def extract_scoreboard_from_video_paddle(
         "away_score": away_score_best,
         "home_score": home_score_best,
         "clock": clk,
-        "quarter_text": quarter_text,
-        "quarter": qtr,
+        "quarter_text": quarter_text,  # raw (mode)
+        "quarter": quarter,            # normalized (mode)
         "used_stub": False,
         "_preset": chosen_preset,
     }
 
-    if not any((away_team, home_team, away_score_text, home_score_text, clk, quarter_text)):
+    if not any((away_team, home_team, away_score_text, home_score_text, clk, quarter_text, quarter)):
         return {"used_stub": True, "_preset": chosen_preset}
 
     if viz:
