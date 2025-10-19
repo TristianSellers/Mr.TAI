@@ -172,6 +172,10 @@ def commentary_from_video(
             str(dest), t=t, attempts=3, viz=viz, profile_key=scoreboard_type
         )
         ctx = ocr_to_commentary_context(ocr)
+        # Merge new OCR fields into context if provided
+        for _k in ("down", "distance", "distance_text", "yardline"):
+            if ocr.get(_k) is not None:
+                ctx[_k] = ocr[_k]
         return CommentaryPrepResponse(context=ctx, ocr=ocr, used_stub=bool(ocr.get("used_stub", False)))
     finally:
         if not keep_uploads:
@@ -207,6 +211,10 @@ def run_commentary_from_video(
             str(dest), t=t, attempts=3, viz=viz, profile_key=scoreboard_type
         )
         ctx = ocr_to_commentary_context(ocr)
+        # Merge new OCR fields into context if provided
+        for _k in ("down", "distance", "distance_text", "yardline"):
+            if ocr.get(_k) is not None:
+                ctx[_k] = ocr[_k]
         if tone:
             ctx["tone"] = tone
         if bias:
