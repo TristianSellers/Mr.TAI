@@ -1160,8 +1160,18 @@ def extract_scoreboard_from_video_paddle(
         "used_stub": False,
         "_preset": chosen_preset,
     }
-
-    if not any((away_team, home_team, away_score_text, home_score_text, clk, quarter_text, quarter)):
+    if not any((
+        away_team,
+        home_team,
+        away_score_text,
+        home_score_text,
+        away_score_best is not None,
+        home_score_best is not None,
+        legacy_score,
+        clk,
+        quarter_text,
+        quarter,
+    )):
         return {"used_stub": True, "_preset": chosen_preset}
 
     if viz:
