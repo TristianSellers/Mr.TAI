@@ -9,13 +9,19 @@ PRIMARY_MAP = [
 "qb_scramble", "run", "tackle_big_hit", "pass_attempt"
 ]
 
-def choose_primary(probs: Dict[str, float]) -> str:
-    # Greedy by a custom priority so decisive outcomes beat generic attempts
-    best = max(probs, key=lambda k: probs[k])
-    # If a decisive label is reasonably high, prefer it
+def choose_primary(probs):
+    best, pbest = max(probs.items(), key=lambda kv: kv[1])
+    # Prefer decisive outcomes ≥ 0.45
     for lbl in PRIMARY_MAP:
-        if probs.get(lbl, 0.0) >= 0.40:
+        if probs.get(lbl, 0.0) >= 0.45:
             return lbl
+    # If 'sack' is low and 'run' is close, favor 'run'
+    if probs.get("sack", 0.0) < 0.30 and (probs.get("run", 0.0) + 0.05) >= probs.get("sack", 0.0):
+        return "run"
+    # Margin check: if top-2 too close, default to pass_attempt (neutral)
+    top2 = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    if len(top2) == 2 and (top2[0][1] - top2[1][1]) < 0.07:
+        return "pass_attempt"
     return best
 
 

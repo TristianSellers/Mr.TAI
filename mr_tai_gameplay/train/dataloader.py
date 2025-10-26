@@ -21,22 +21,39 @@ class ClipDataset(Dataset):
 
 
     def _read_clip(self, path: str, t_start: float, t_end: float):
+        import cv2
+        import numpy as np
+        import torch
+
         cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Could not open video: {path}")
+
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        s = int(t_start*fps); e = max(s+1, int(t_end*fps))
-        idxs = np.linspace(s, e-1, self.num_frames).astype(int)
+        s = int(t_start * fps)
+        e = max(s + 1, int(t_end * fps))
+        idxs = np.linspace(s, e - 1, self.num_frames).astype(int)
+
         frames = []
-        import PIL.Image
         for i in idxs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
             ok, f = cap.read()
-            if not ok: break
+            if not ok:
+                break
             f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-            frames.append(PIL.Image.fromarray(f))
+            frames.append(f)
         cap.release()
-        x = self.tfm(frames) # C,T,H,W
-        return x
 
+        if not frames:
+            raise RuntimeError(f"No frames decoded from: {path}")
+
+        # (T, H, W, C) -> Tensor and permute to (T, C, H, W) for video transforms
+        vid = torch.from_numpy(np.stack(frames, axis=0))   # uint8, T,H,W,C
+        vid = vid.permute(0, 3, 1, 2).contiguous()         # T,C,H,W
+
+        # torchvision video preset returns (C, T, H, W)
+        x = self.tfm(vid)
+        return x
 
     def __getitem__(self, i):
         it = self.items[i]

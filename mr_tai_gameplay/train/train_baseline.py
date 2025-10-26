@@ -4,8 +4,8 @@ from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 from tqdm import tqdm
 
-from dataloader import ClipDataset
-from models.r3d18_baseline import R3D18
+from train.dataloader import ClipDataset
+from train.models.r3d18_baseline import R3D18
 from src.schemas import LABELS
 
 
@@ -18,16 +18,23 @@ def train(
     device: str = "cpu",
 ):
     ds = ClipDataset(index_json)
-    n = len(ds)
-    n_train = int(0.9 * n)
-    n_val = n - n_train
-    train_ds, val_ds = random_split(ds, [n_train, n_val])
 
-    tl = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=2)
-    vl = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=2)
+    # If dataset is tiny, train on all samples (no validation split)
+    if len(ds) < 6:
+        train_ds, val_ds = ds, None
+    else:
+        n = len(ds)
+        n_train = int(0.9 * n)
+        n_val = n - n_train
+        train_ds, val_ds = random_split(ds, [n_train, n_val])
 
-    model = R3D18().to(device)
-    opt = optim.AdamW(model.parameters(), lr=lr)
+    # macOS note: num_workers=0 avoids spawn issues in small setups
+    tl = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=0)
+    vl = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=0) if val_ds else None
+
+    # Head-only fine-tune by default (fast & stable for micro-datasets)
+    model = R3D18(head_only=True).to(device)
+    opt = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     crit = nn.CrossEntropyLoss()
 
     out = Path(out_dir)
@@ -45,23 +52,25 @@ def train(
             loss = crit(logits, y)
             loss.backward()
             opt.step()
-            tr_loss += float(loss)
+            tr_loss += loss.detach().item()
 
-        # ---- validate ----
-        model.eval()
-        corr = 0
-        tot = 0
-        with torch.no_grad():
-            for x, y in tqdm(vl, desc=f"epoch {ep} val"):
-                x = x.to(device)
-                y = y.to(device)
-                logits = model(x)
-                pred = logits.argmax(dim=1)
-                corr += int((pred == y).sum())
-                tot += int(y.numel())
-        acc = corr / max(1, tot)
-
-        print(f"epoch {ep}: train_loss={tr_loss / max(1, len(tl)):.4f}  val_acc={acc:.3f}")
+        # ---- validate (optional) ----
+        if vl is not None:
+            model.eval()
+            corr = 0
+            tot = 0
+            with torch.no_grad():
+                for x, y in tqdm(vl, desc=f"epoch {ep} val"):
+                    x = x.to(device)
+                    y = y.to(device)
+                    logits = model(x)
+                    pred = logits.argmax(dim=1)
+                    corr += int((pred == y).sum())
+                    tot += int(y.numel())
+            acc = corr / max(1, tot)
+            print(f"epoch {ep}: train_loss={tr_loss / max(1, len(tl)):.4f}  val_acc={acc:.3f}")
+        else:
+            print(f"epoch {ep}: train_loss={tr_loss / max(1, len(tl)):.4f}  (no validation)")
 
         # save checkpoint
         ckpt_path = out / f"r3d18_ep{ep:02d}.pt"

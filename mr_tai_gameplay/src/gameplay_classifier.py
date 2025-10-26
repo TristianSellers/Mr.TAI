@@ -37,11 +37,22 @@ class GameplayClassifier:
 
 
     def _sample_clip(self, path: str, t_start: float, t_end: float, num_frames: int = 16) -> torch.Tensor:
+        import cv2
+        import numpy as np
+        import torch
+
+        # Open the video
         cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Could not open video: {path}")
+
+        # Determine frame indices
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         s_idx = int(t_start * fps)
-        e_idx = max(s_idx+1, int(t_end * fps))
-        idxs = np.linspace(s_idx, e_idx-1, num_frames).astype(int)
+        e_idx = max(s_idx + 1, int(t_end * fps))
+        idxs = np.linspace(s_idx, e_idx - 1, num_frames).astype(int)
+
+        # Read and convert frames
         frames = []
         for i in idxs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
@@ -51,15 +62,19 @@ class GameplayClassifier:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(frame)
         cap.release()
-        if len(frames) == 0:
-            raise RuntimeError("No frames sampled")
-        # To PIL then transform expects (T, H, W, C)
-        import PIL.Image
-        frames = [PIL.Image.fromarray(f) for f in frames]
-        # transforms in weights expect list of PIL Images → torch (C,T,H,W)
-        sample = self._transform(frames) # C,T,H,W
-        # add batch dim → (B,C,T,H,W)
-        return sample.unsqueeze(0)
+
+        if not frames:
+            raise RuntimeError(f"No frames could be read from {path}")
+
+        # Stack frames → (T, H, W, C) uint8
+        vid = torch.from_numpy(np.stack(frames, axis=0))          # uint8
+        # Reorder to (T, C, H, W) for torchvision video transforms
+        vid = vid.permute(0, 3, 1, 2).contiguous()                # T, C, H, W
+
+        # Apply pretrained transform (returns C, T, H, W)
+        sample = self._transform(vid)                             # C, T, H, W
+        return sample.unsqueeze(0)                                # B, C, T, H, W
+
 
 
     def predict(self, video_path: str, t_start: float, t_end: float) -> Dict[str, float]:
