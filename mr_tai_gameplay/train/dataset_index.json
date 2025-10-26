@@ -1,0 +1,4 @@
+[
+  { "video": "../Madden Clip.mp4", "t_start": 0.03, "t_end": 4.47, "label": "run" },
+  { "video": "../Madden Clip.mp4", "t_start": 11.00, "t_end": 17.50, "label": "pass_attempt" }
+]

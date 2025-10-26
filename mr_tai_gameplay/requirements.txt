@@ -1,0 +1,12 @@
+# Core
+torch>=2.3
+torchvision>=0.18
+opencv-python>=4.10
+numpy>=1.26
+scipy>=1.11
+ffmpeg-python>=0.2
+moviepy>=1.0.3
+# Optional audio timing assist (kept off by default in this kit)
+# librosa>=0.10
+# For power users (optional)
+# pytorchvideo>=0.1.5
