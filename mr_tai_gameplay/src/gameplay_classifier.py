@@ -1,58 +1,38 @@
 from __future__ import annotations
 import torch
-import torch.nn as nn
 import torchvision
 import cv2
 import numpy as np
 from typing import Dict, List, Tuple
 from .schemas import LABELS
-
-
-class R3D18Baseline(nn.Module):
-    """Simple baseline built on torchvision R3D-18 (Kinetics pretrained).
-    Last layer replaced with |LABELS| classes.
-    """
-    def __init__(self, num_classes: int = len(LABELS)):
-        super().__init__()
-        self.backbone = torchvision.models.video.r3d_18(weights=
-        torchvision.models.video.R3D_18_Weights.KINETICS400_V1
-        )
-        in_f = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(in_f, num_classes)
-
-    def forward(self, x):
-        return self.backbone(x)
+from train.models.r3d18_baseline import R3D18
 
 
 class GameplayClassifier:
     def __init__(self, device: str = "cpu", ckpt_path: str | None = None):
         self.device = torch.device(device)
-        self.model = R3D18Baseline().to(self.device).eval()
-        if ckpt_path:
-            self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
-        # Normalization for Kinetics weights
-        w = torchvision.models.video.R3D_18_Weights.KINETICS400_V1
-        t = w.transforms()
-        self._transform = t
 
+        # Use the SAME architecture as training so checkpoint keys match
+        self.model = R3D18(num_classes=len(LABELS), head_only=False).to(self.device).eval()
+
+        if ckpt_path:
+            state = torch.load(ckpt_path, map_location=self.device)
+            self.model.load_state_dict(state, strict=True)
+
+        # Kinetics-400 video preset transforms (expects Tensor video: T,C,H,W)
+        w = torchvision.models.video.R3D_18_Weights.KINETICS400_V1
+        self._transform = w.transforms()
 
     def _sample_clip(self, path: str, t_start: float, t_end: float, num_frames: int = 16) -> torch.Tensor:
-        import cv2
-        import numpy as np
-        import torch
-
-        # Open the video
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             raise FileNotFoundError(f"Could not open video: {path}")
 
-        # Determine frame indices
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         s_idx = int(t_start * fps)
         e_idx = max(s_idx + 1, int(t_end * fps))
         idxs = np.linspace(s_idx, e_idx - 1, num_frames).astype(int)
 
-        # Read and convert frames
         frames = []
         for i in idxs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
@@ -66,25 +46,21 @@ class GameplayClassifier:
         if not frames:
             raise RuntimeError(f"No frames could be read from {path}")
 
-        # Stack frames → (T, H, W, C) uint8
-        vid = torch.from_numpy(np.stack(frames, axis=0))          # uint8
-        # Reorder to (T, C, H, W) for torchvision video transforms
-        vid = vid.permute(0, 3, 1, 2).contiguous()                # T, C, H, W
+        # (T, H, W, C) -> (T, C, H, W) tensor for video transforms
+        vid = torch.from_numpy(np.stack(frames, axis=0))        # uint8
+        vid = vid.permute(0, 3, 1, 2).contiguous()              # T, C, H, W
 
-        # Apply pretrained transform (returns C, T, H, W)
-        sample = self._transform(vid)                             # C, T, H, W
-        return sample.unsqueeze(0)                                # B, C, T, H, W
+        # Preset returns (C, T, H, W)
+        sample = self._transform(vid)                           # C, T, H, W
+        return sample.unsqueeze(0)                              # B, C, T, H, W
 
-
-
-    def predict(self, video_path: str, t_start: float, t_end: float) -> Dict[str, float]:
+    def predict(self, video_path: str, t_start: float, t_end: float, num_frames: int = 16) -> Dict[str, float]:
         with torch.no_grad():
-            clip = self._sample_clip(video_path, t_start, t_end)
+            clip = self._sample_clip(video_path, t_start, t_end, num_frames=num_frames)
             clip = clip.to(self.device)
             logits = self.model(clip)[0]
             probs = torch.softmax(logits, dim=-1).cpu().numpy().tolist()
         return {lbl: float(probs[i]) for i, lbl in enumerate(LABELS)}
-
 
     @staticmethod
     def topk(probs: Dict[str, float], k: int = 3) -> List[Tuple[str, float]]:
