@@ -477,3 +477,6 @@ app.include_router(ocr_router)
 
 from backend.routers.pipeline_api import router as pipeline_router
 app.include_router(pipeline_router)
+
+from backend.routers.infer import router as infer_router
+app.include_router(infer_router)

@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
 import torchvision
-from src.schemas import LABELS
-
+try:
+    from mr_tai_gameplay.src.schemas import LABELS
+except ImportError:  # when running: python -m train.train_baseline
+    from src.schemas import LABELS
+    
 class R3D18(nn.Module):
     def __init__(self, num_classes: int = len(LABELS), head_only: bool = True):
         super().__init__()

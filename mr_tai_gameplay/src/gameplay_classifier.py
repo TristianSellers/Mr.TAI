@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from typing import Dict, List, Tuple
 from .schemas import LABELS
-from train.models.r3d18_baseline import R3D18
+from mr_tai_gameplay.train.models.r3d18_baseline import R3D18
 
 
 class GameplayClassifier:
