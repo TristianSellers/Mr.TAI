@@ -20,7 +20,7 @@ def choose_primary(probs: Dict[str, float]) -> str:
             return lbl
 
     # Handoff bias: if completion only slightly above run, prefer run
-    comp = probs.get("completion", 0.0)
+    comp = probs.get("complete_pass", probs.get("completion", 0.0))
     runp = probs.get("run", 0.0)
     if comp < 0.35 and (comp - runp) <= 0.10:
         return "run"
