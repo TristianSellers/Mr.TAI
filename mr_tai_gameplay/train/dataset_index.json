@@ -1,15 +1,17 @@
 [
-  { "video": "MNP Recording.mp4",            "t_start": 6.00,  "t_end": 15.00,  "label": "completion" },
-  { "video": "SNP 0-7 Recording.mp4",        "t_start": 5.00,  "t_end": 15.00,  "label": "touchdown" },
-  { "video": "SNP 6-7 Recording.mp4",        "t_start": 8.00,  "t_end": 13.00,  "label": "extra_point_good" },
-  { "video": "SNP 7-0 Recording.mp4",        "t_start": 0.00,  "t_end": 8.00,   "label": "no_event" },
-  { "video": "SNP 10-3 Recording.mp4",       "t_start": 6.50,  "t_end": 10.00,  "label": "run" },
-  { "video": "SNP Recording.mp4",            "t_start": 1.00,  "t_end": 5.00,   "label": "run" },
-  { "video": "SNP Recording.mp4",            "t_start": 18.00, "t_end": 24.50,  "label": "completion" },
-  { "video": "TNP 0-7 Recording.mp4",        "t_start": 9.00,  "t_end": 19.00,  "label": "interception" },
-  { "video": "TNP 9-14 Recording.mp4",       "t_start": 9.00,  "t_end": 15.00,  "label": "two_point_good" },
-  { "video": "TNP Recording.mp4",            "t_start": 10.00, "t_end": 16.00,  "label": "field_goal_missed" },
+  { "video": "MNP Recording.mp4",     "t_start": 6.00,  "t_end": 15.00,  "label": "complete_pass",     "note": "complete pass for first down" },
 
-  { "video": "Madden Clip.mp4",           "t_start": 0.03,  "t_end": 4.47,   "label": "run" },
-  { "video": "Madden Clip.mp4",           "t_start": 11.00, "t_end": 17.50,  "label": "incomplete" }
+  { "video": "SNP 0-7 Recording.mp4", "t_start": 5.00,  "t_end": 15.00,  "label": "touchdown",         "note": "complete pass for touchdown" },
+  { "video": "SNP 6-7 Recording.mp4", "t_start": 8.00,  "t_end": 13.00,  "label": "extra_point_good",  "note": "completed extra point field goal" },
+  { "video": "SNP 7-0 Recording.mp4", "t_start": 0.00,  "t_end": 8.00,   "label": "no_event",          "note": "nothing, announcer filler time" },
+  { "video": "SNP 10-3 Recording.mp4","t_start": 6.50,  "t_end": 10.00,  "label": "run",               "note": "run for positive gain" },
+  { "video": "SNP Recording.mp4",     "t_start": 1.00,  "t_end": 5.00,   "label": "run",               "note": "run for negative gain" },
+  { "video": "SNP Recording.mp4",     "t_start": 18.00, "t_end": 24.50,  "label": "complete_pass",     "note": "complete pass short of first down" },
+
+  { "video": "TNP 0-7 Recording.mp4", "t_start": 9.00,  "t_end": 19.00,  "label": "interception",      "note": "illegal forward pass, interception" },
+  { "video": "TNP 9-14 Recording.mp4","t_start": 9.00,  "t_end": 15.00,  "label": "two_point_good",    "note": "complete pass for 2 pt conversion" },
+  { "video": "TNP Recording.mp4",     "t_start": 10.00, "t_end": 16.00,  "label": "field_goal_missed", "note": "missed field goal" },
+
+  { "video": "Madden Clip.mp4",       "t_start": 0.03,  "t_end": 4.47,   "label": "run",               "note": "run for negative gain" },
+  { "video": "Madden Clip.mp4",       "t_start": 11.00, "t_end": 17.50,  "label": "incomplete_pass",   "note": "incomplete pass" }
 ]

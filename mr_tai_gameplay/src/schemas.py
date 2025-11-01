@@ -4,14 +4,15 @@ from typing import List, Dict, Any, Union
 
 LABELS = [
     # core offense/defense
-    "run", "qb_scramble", "pass_attempt", "completion", "incomplete",
+    "run", "qb_scramble", "pass_attempt",
+    "complete_pass", "incomplete_pass",
     "sack", "tackle_big_hit", "interception", "fumble",
     # scoring & conversions
-    "touchdown", "field_goal_good", "field_goal_missed", "extra_point_good", "two_point_good",
-    # meta (useful for segmenter fallbacks and training negatives)
+    "touchdown", "field_goal_good", "field_goal_missed",
+    "extra_point_good", "two_point_good",
+    # meta
     "no_event",
 ]
-
 
 @dataclass
 class Event:

@@ -5,11 +5,9 @@ from .templates import one_liner
 
 # Expanded to include scoring + meta for clarity when confident
 PRIMARY_MAP = [
-    "touchdown", "field_goal_good", "field_goal_missed",
-    "extra_point_good", "two_point_good",
-    "interception", "fumble",
-    "sack", "completion", "incomplete",
-    "qb_scramble", "run", "tackle_big_hit", "pass_attempt", "no_event",
+    "touchdown", "interception", "fumble",
+    "sack", "complete_pass", "incomplete_pass",
+    "qb_scramble", "run", "tackle_big_hit", "pass_attempt"
 ]
 
 def choose_primary(probs: Dict[str, float]) -> str:
@@ -17,7 +15,7 @@ def choose_primary(probs: Dict[str, float]) -> str:
 
     # Strong, decisive picks take priority
     for lbl in ["touchdown","field_goal_good","field_goal_missed","extra_point_good","two_point_good",
-                "interception","fumble","sack","completion","incomplete"]:
+            "interception","fumble","sack","complete_pass","incomplete_pass"]:
         if probs.get(lbl, 0.0) >= 0.45:
             return lbl
 
