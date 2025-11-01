@@ -3,11 +3,16 @@ from typing import List, Dict, Any, Union
 
 
 LABELS = [
-"run", "pass_attempt", "completion", "incomplete",
-"sack", "qb_scramble", "interception", "fumble",
-"touchdown", "tackle_big_hit"
+    # core offense/defense
+    "run", "qb_scramble", "pass_attempt",
+    "complete_pass", "incomplete_pass",
+    "sack", "tackle_big_hit", "interception", "fumble",
+    # scoring & conversions
+    "touchdown", "field_goal_good", "field_goal_missed",
+    "extra_point_good", "two_point_good",
+    # meta
+    "no_event",
 ]
-
 
 @dataclass
 class Event:
