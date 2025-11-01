@@ -40,7 +40,11 @@ def fuse(
 ) -> Dict[str, Any]:
     lines = []
     for ev in gameplay.events:
-        yards = banner.yard_gain if banner else None
+        yards = None
+        # Prefer scoreboard-derived yards if you store them there, else banner
+        if banner and getattr(banner, "yard_gain", None) is not None:
+            yards = banner.yard_gain
+        # TODO: If later you compute yards from scoreboard deltas, set `yards` here.
         text = one_liner(ev.primary_label, yards, scoreboard, banner)
         t_say = ev.t_end + 0.30  # speak shortly after the tackle/finish
         lines.append({"t_say": round(t_say, 2), "text": text})
