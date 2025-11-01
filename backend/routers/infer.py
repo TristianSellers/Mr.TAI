@@ -1,19 +1,27 @@
-# src/api/routes/infer.py
+# backend/routers/infer.py
 from __future__ import annotations
-from mr_tai_gameplay.src.pipeline_infer import run_inference_multi
+
+import os
+import json
+import asyncio
+import tempfile
+from uuid import uuid4
+from pathlib import Path
+
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from pathlib import Path
-import tempfile, json, os, shutil
-from uuid import uuid4
 
-# Optional: torch is only used for device selection
+# Import your gameplay pipeline
+from mr_tai_gameplay.src.pipeline_infer import run_inference_multi
+
+# Optional: torch only for device selection (handle absence gracefully)
 try:
     import torch
-except Exception:  # torch not available? default to CPU
+except Exception:
     torch = None
 
 router = APIRouter()
+
 
 # (Stub) your TTS hook — wire this up later
 def synth_tts(text: str, voice_id: str | None, emotion: str | None) -> str | None:
@@ -21,8 +29,12 @@ def synth_tts(text: str, voice_id: str | None, emotion: str | None) -> str | Non
     # Return None to skip audio for now.
     return None
 
+
 def _select_device() -> str:
-    # MODEL_DEVICE can force a device: "cpu" | "cuda" | "mps"
+    """
+    Auto-select an available device, with env override:
+    - MODEL_DEVICE can be "cpu" | "cuda" | "mps"
+    """
     forced = (os.getenv("MODEL_DEVICE") or "").lower().strip()
     if forced in {"cpu", "cuda", "mps"}:
         return forced
@@ -51,32 +63,39 @@ async def infer_clip(
         ckpt = None
 
     try:
-        # 1) Save upload safely to temp and run multi-segment inference
+        # 1) Save upload safely to a temp file (streamed; no large RAM usage)
         with tempfile.TemporaryDirectory() as td:
             safe_name = Path(file.filename or "upload.mp4").name
             tmp_path = Path(td) / f"{uuid4().hex}_{safe_name}"
 
-            # ✅ Stream the file to disk to avoid loading full content into memory
+            # Stream the file to disk in 1 MB chunks
             with tmp_path.open("wb") as out_file:
-                while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+                while chunk := await file.read(1024 * 1024):
                     out_file.write(chunk)
 
+            # 2) Run heavy inference off the event loop (in a worker thread)
             out_json = Path(td) / "out.json"
-            run_inference_multi(
+            await asyncio.to_thread(
+                run_inference_multi,
                 str(tmp_path),
                 str(out_json),
-                device=device,
-                ckpt=ckpt,
+                None,            # clip_id
+                None,            # scoreboard_json
+                None,            # banner_json
+                device,
+                ckpt,
+                32,              # frames_per_window
             )
+
             payload = json.loads(out_json.read_text())
 
-        # 2) Stitch commentary text from timed lines (also return lines verbatim)
+        # 3) Stitch commentary text from timed lines (also return lines verbatim)
         lines = payload.get("tts", {}).get("lines", [])
         stitched = "\n".join(
             [ln.get("text", "").strip() for ln in lines if (ln.get("text") or "").strip()]
         )
 
-        # 3) (Optional) TTS — wire this up later
+        # 4) (Optional) TTS — wire this up later
         audio_rel = synth_tts(stitched, voiceId, emotion) if tts else None
 
         return JSONResponse({
@@ -91,12 +110,12 @@ async def infer_clip(
             },
             # Debug + UI data
             "gameplay_only": payload.get("gameplay_only"),
-            "tts": payload.get("tts"),  # includes {"clip_id", "lines":[{t_say, text}, ...]}
+            "tts": payload.get("tts"),  # {"clip_id", "lines":[{t_say, text}, ...]}
         })
 
     except (ValueError, FileNotFoundError) as e:
-        # Bad input or unreadable video
+        # Bad input or unreadable video (return 400, not a crashed worker)
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
-        # Unexpected errors — do not crash the worker
+        # Unexpected errors — keep the server alive
         return JSONResponse({"error": f"internal error: {e}"}, status_code=500)
