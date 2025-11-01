@@ -14,8 +14,13 @@ def choose_primary(probs: Dict[str, float]) -> str:
     best, pbest = max(probs.items(), key=lambda kv: kv[1])
 
     # Strong, decisive picks take priority
-    for lbl in ["touchdown","field_goal_good","field_goal_missed","extra_point_good","two_point_good",
-            "interception","fumble","sack","complete_pass","incomplete_pass"]:
+    for lbl in [
+    "touchdown", "field_goal_good", "field_goal_missed",
+    "extra_point_good", "two_point_good",
+    "interception", "fumble",
+    "sack", "complete_pass", "incomplete_pass",
+    "run", "qb_scramble"
+    ]:
         if probs.get(lbl, 0.0) >= 0.45:
             return lbl
 
