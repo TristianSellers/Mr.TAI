@@ -5,6 +5,7 @@ from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pathlib import Path
 import tempfile, json, os
+from uuid import uuid4
 
 # Optional: torch is only used for device selection
 try:
@@ -51,8 +52,8 @@ async def infer_clip(
     try:
         # 1) Save upload to temp and run multi-segment inference
         with tempfile.TemporaryDirectory() as td:
-            filename = file.filename or "upload.mp4"
-            tmp_path = Path(td) / filename
+            safe_name = Path(file.filename or "upload.mp4").name
+            tmp_path = Path(td) / f"{uuid4().hex}_{safe_name}"
             tmp_path.write_bytes(await file.read())
 
             out_json = Path(td) / "out.json"
