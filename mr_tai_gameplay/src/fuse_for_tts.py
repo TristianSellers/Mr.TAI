@@ -1,37 +1,49 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional
-from .schemas import GameplayPrediction, ScoreboardFacts, BannerFacts, LABELS
+from .schemas import GameplayPrediction, ScoreboardFacts, BannerFacts
 from .templates import one_liner
 
+# Expanded to include scoring + meta for clarity when confident
 PRIMARY_MAP = [
-"touchdown", "interception", "fumble",
-"sack", "completion", "incomplete",
-"qb_scramble", "run", "tackle_big_hit", "pass_attempt"
+    "touchdown", "field_goal_good", "field_goal_missed",
+    "extra_point_good", "two_point_good",
+    "interception", "fumble",
+    "sack", "completion", "incomplete",
+    "qb_scramble", "run", "tackle_big_hit", "pass_attempt", "no_event",
 ]
 
-def choose_primary(probs):
+def choose_primary(probs: Dict[str, float]) -> str:
     best, pbest = max(probs.items(), key=lambda kv: kv[1])
-    # Prefer decisive outcomes ≥ 0.45
-    for lbl in PRIMARY_MAP:
+
+    # Strong, decisive picks take priority
+    for lbl in ["touchdown","field_goal_good","field_goal_missed","extra_point_good","two_point_good",
+                "interception","fumble","sack","completion","incomplete"]:
         if probs.get(lbl, 0.0) >= 0.45:
             return lbl
-    # If 'sack' is low and 'run' is close, favor 'run'
-    if probs.get("sack", 0.0) < 0.30 and (probs.get("run", 0.0) + 0.05) >= probs.get("sack", 0.0):
+
+    # Handoff bias: if completion only slightly above run, prefer run
+    comp = probs.get("completion", 0.0)
+    runp = probs.get("run", 0.0)
+    if comp < 0.35 and (comp - runp) <= 0.10:
         return "run"
-    # Margin check: if top-2 too close, default to pass_attempt (neutral)
+
+    # Near-tie fallback goes to neutral "pass_attempt"
     top2 = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if len(top2) == 2 and (top2[0][1] - top2[1][1]) < 0.07:
         return "pass_attempt"
+
     return best
 
 
-def fuse(gameplay: GameplayPrediction,
-        scoreboard: Optional[ScoreboardFacts] = None,
-        banner: Optional[BannerFacts] = None) -> Dict[str, Any]:
+def fuse(
+    gameplay: GameplayPrediction,
+    scoreboard: Optional[ScoreboardFacts] = None,
+    banner: Optional[BannerFacts] = None
+) -> Dict[str, Any]:
     lines = []
     for ev in gameplay.events:
         yards = banner.yard_gain if banner else None
         text = one_liner(ev.primary_label, yards, scoreboard, banner)
-        t_say = ev.t_end + 0.30 # speak shortly after the tackle
+        t_say = ev.t_end + 0.30  # speak shortly after the tackle/finish
         lines.append({"t_say": round(t_say, 2), "text": text})
     return {"clip_id": gameplay.clip_id, "lines": lines}

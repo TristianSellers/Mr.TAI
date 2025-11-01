@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Dict, Any, Union, Optional
+from typing import Optional
 import json
 
 from .event_segmenter import EventSegmenter
@@ -10,13 +10,15 @@ from .schemas import Event, GameplayPrediction, ScoreboardFacts, BannerFacts
 from .fuse_for_tts import fuse, choose_primary
 from .utils_io import save_json
 
-def run_inference(video_path: str,
-                out_json: str,
-                clip_id: Optional[str] = None,
-                scoreboard_json: Optional[str] = None,
-                banner_json: Optional[str] = None,
-                device: str = "cpu",
-                ckpt: Optional[str] = None):
+def run_inference(
+    video_path: str,
+    out_json: str,
+    clip_id: Optional[str] = None,
+    scoreboard_json: Optional[str] = None,
+    banner_json: Optional[str] = None,
+    device: str = "cpu",
+    ckpt: Optional[str] = None,
+):
     clip_id = clip_id or Path(video_path).stem
 
     seg = EventSegmenter()
@@ -26,13 +28,21 @@ def run_inference(video_path: str,
     t_start, t_end = windows[0]
 
     clf = GameplayClassifier(device=device, ckpt_path=ckpt)
-    probs = clf.predict(video_path, t_start, t_end)
+    NUM_FRAMES = 32
+    probs = clf.predict(video_path, t_start, t_end, num_frames=NUM_FRAMES)
     primary = choose_primary(probs)
 
-    event = Event(t_start=float(t_start), t_end=float(t_end),
-                primary_label=primary, confidence=float(probs[primary]),
-                alt_labels=[{"label": k, "p": float(v)} for k, v in sorted(probs.items(), key=lambda x: x[1], reverse=True)[:3]],
-                evidence={"frames": 16})
+    event = Event(
+        t_start=float(t_start),
+        t_end=float(t_end),
+        primary_label=primary,
+        confidence=float(probs[primary]),
+        alt_labels=[
+            {"label": k, "p": float(v)}
+            for k, v in sorted(probs.items(), key=lambda x: x[1], reverse=True)[:3]
+        ],
+        evidence={"frames": NUM_FRAMES},
+    )
     gp = GameplayPrediction(clip_id=clip_id, events=[event])
 
     sb = None
@@ -44,13 +54,16 @@ def run_inference(video_path: str,
 
     fused = fuse(gp, sb, bn)
 
-    save_json({
-        "gameplay_only": {
-            "clip_id": gp.clip_id,
-            "events": [asdict(event)]
+    save_json(
+        {
+            "gameplay_only": {
+                "clip_id": gp.clip_id,
+                "events": [asdict(event)],
+            },
+            "tts": fused,
         },
-        "tts": fused
-    }, out_json)
+        out_json,
+    )
 
 
 if __name__ == "__main__":
@@ -65,7 +78,12 @@ if __name__ == "__main__":
     p.add_argument("--ckpt", default=None)
     args = p.parse_args()
 
-
-    run_inference(args.video, args.out, args.clip_id,
-                args.scoreboard_json, args.banner_json,
-                device=args.device, ckpt=args.ckpt)
+    run_inference(
+        args.video,
+        args.out,
+        args.clip_id,
+        args.scoreboard_json,
+        args.banner_json,
+        device=args.device,
+        ckpt=args.ckpt,
+    )

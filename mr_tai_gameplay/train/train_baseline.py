@@ -1,12 +1,29 @@
 from __future__ import annotations
-import torch, torch.nn as nn, torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+import json
 from pathlib import Path
+from collections import Counter
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split, Subset
 from tqdm import tqdm
 
 from train.dataloader import ClipDataset
 from train.models.r3d18_baseline import R3D18
 from src.schemas import LABELS
+
+
+def _labels_for_split(index_json: str, split) -> list[str]:
+    """
+    Return the list of string labels for whichever split we're training on,
+    without reaching into Dataset/Subset internals that annoy Pylance.
+    """
+    data = json.loads(Path(index_json).read_text())
+    if isinstance(split, Subset):
+        idxs = list(split.indices)
+        data = [data[i] for i in idxs]
+    return [row["label"] for row in data]
 
 
 def train(
@@ -35,7 +52,22 @@ def train(
     # Head-only fine-tune by default (fast & stable for micro-datasets)
     model = R3D18(head_only=True).to(device)
     opt = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
-    crit = nn.CrossEntropyLoss()
+
+    # ---- Class-weighted loss (robust to Dataset/Subset types) ----
+    try:
+        split_labels = _labels_for_split(index_json, train_ds)
+        freq = Counter(split_labels)
+        weights = torch.tensor(
+            [1.0 / max(freq.get(lbl, 1), 1) for lbl in LABELS], dtype=torch.float, device=device
+        )
+        # Normalize to keep average weight ~1
+        weights = weights / weights.mean()
+        crit = nn.CrossEntropyLoss(weight=weights)
+        print(f"[INFO] Using class-weighted loss with frequencies: {dict(freq)}")
+        print(f"[INFO] Weights (LABELS order): {weights.detach().cpu().numpy().tolist()}")
+    except Exception as e:
+        print(f"[WARN] Could not compute class weights ({e}); using unweighted loss.")
+        crit = nn.CrossEntropyLoss()
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
