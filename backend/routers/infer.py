@@ -4,7 +4,7 @@ from mr_tai_gameplay.src.pipeline_infer import run_inference_multi
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pathlib import Path
-import tempfile, json, os
+import tempfile, json, os, shutil
 from uuid import uuid4
 
 # Optional: torch is only used for device selection
@@ -33,6 +33,7 @@ def _select_device() -> str:
             return "cuda"
     return "cpu"
 
+
 @router.post("/infer")
 async def infer_clip(
     file: UploadFile = File(...),
@@ -50,11 +51,15 @@ async def infer_clip(
         ckpt = None
 
     try:
-        # 1) Save upload to temp and run multi-segment inference
+        # 1) Save upload safely to temp and run multi-segment inference
         with tempfile.TemporaryDirectory() as td:
             safe_name = Path(file.filename or "upload.mp4").name
             tmp_path = Path(td) / f"{uuid4().hex}_{safe_name}"
-            tmp_path.write_bytes(await file.read())
+
+            # ✅ Stream the file to disk to avoid loading full content into memory
+            with tmp_path.open("wb") as out_file:
+                while chunk := await file.read(1024 * 1024):  # 1 MB chunks
+                    out_file.write(chunk)
 
             out_json = Path(td) / "out.json"
             run_inference_multi(
