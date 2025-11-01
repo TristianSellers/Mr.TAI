@@ -29,7 +29,7 @@ def run_inference(
     seg = EventSegmenter()
     windows = seg.segment(video_path)
     if not windows:
-        raise SystemExit("No event window detected.")
+        raise ValueError("No event window detected or video unreadable.")
     t_start, t_end = windows[0]
 
     clf = GameplayClassifier(device=device, ckpt_path=ckpt)
@@ -92,7 +92,7 @@ def run_inference_multi(
     seg = EventSegmenter()
     windows = seg.segment_all(video_path)
     if not windows:
-        raise SystemExit("No event windows detected.")
+        raise ValueError("No event windows detected or video unreadable.")
 
     clf = GameplayClassifier(device=device, ckpt_path=ckpt)
 
