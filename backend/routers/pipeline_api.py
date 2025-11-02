@@ -4,15 +4,29 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Query
 from pydantic import BaseModel
 from typing import Optional, Iterable, Dict, Any, List
 from pathlib import Path, PurePath
-import shutil, os, uuid, subprocess, shlex
+import shutil, os, uuid, subprocess, shlex, json
 
 from backend.services.ocr_paddle import extract_scoreboard_from_video_paddle
 from backend.services.context_from_ocr import ocr_to_commentary_context
 from backend.services.llm_providers import get_llm
 from backend.services.tts_providers import get_tts
-from backend.services.tone_profiles import build_llm_prompt, normalize_tone
+from backend.services.tone_profiles import build_llm_prompt as build_llm_prompt_scoreboard
+from backend.services.tone_profiles import normalize_tone
 from backend.services.mux import mux_audio_video
 from backend.main import DATA_DIR, to_static_url
+
+# Gameplay recognizer & device select
+from mr_tai_gameplay.src.pipeline_infer import run_inference_multi
+
+try:
+    import torch
+except Exception:
+    torch = None  # torch optional for device auto-select
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -56,6 +70,32 @@ def _safe_save_upload(upload: UploadFile, allow_exts: Iterable[str]) -> Path:
         except Exception:
             pass
     return dest
+
+def _select_device() -> str:
+    # Env override: MODEL_DEVICE=cpu|cuda|mps
+    forced = (os.getenv("MODEL_DEVICE") or "").lower().strip()
+    if forced in {"cpu", "cuda", "mps"}:
+        return forced
+    if torch is not None:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    return "cpu"
+
+def _video_duration_seconds(path: Path) -> float:
+    try:
+        if cv2 is None:
+            return 0.0
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return 0.0
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        nframes = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        cap.release()
+        return float(nframes / fps) if (fps > 0 and nframes > 0) else 0.0
+    except Exception:
+        return 0.0
 
 # ---------- Models ----------
 class CommentaryPrepResponse(BaseModel):
@@ -225,24 +265,98 @@ def run_commentary_from_video(
         if gender_val not in ("male", "female"):
             gender_val = "male"
 
-        # 2) LLM — build prompt & (optionally) save it
+        # 2) Gameplay recognizer → event timeline (multi-segment)
+        device = _select_device()
+        ckpt = os.getenv("MODEL_CKPT", "out_ckpt/r3d18_ep10.pt")
+        if ckpt and not Path(ckpt).exists():
+            ckpt = None  # fall back gracefully
+
+        gp_json = (TMP_DIR / f"{run_id}_gp.json").resolve()
+        run_inference_multi(
+            str(dest),
+            str(gp_json),
+            device=device,
+            ckpt=ckpt,
+            segmentation="peaks",
+            frames_per_window=32,
+        )
+        gp_payload = json.loads(gp_json.read_text()) if gp_json.exists() else {}
+
+        # --- RAW timeline for the LLM to repair (do not sanitize here) ---
+        events: List[Dict[str, Any]] = gp_payload.get("gameplay_only", {}).get("events", [])
+        raw_timeline_lines: List[str] = []
+        for ev in sorted(events, key=lambda e: float(e.get("t_start", 0.0))):
+            t0 = float(ev.get("t_start", 0.0))
+            t1 = float(ev.get("t_end", 0.0))
+            lbl = str(ev.get("primary_label", "no_event")).replace("_", " ")
+            # Keep raw, even if end<=start or end==0; the LLM will repair
+            raw_timeline_lines.append(f"- [{t0:0.2f}s → {t1:0.2f}s] {lbl}")
+        raw_timeline_block = "\n".join(raw_timeline_lines) if raw_timeline_lines else "- (no detected events)"
+
+        # Determine total duration (upper bound for t_say)
+        duration = _video_duration_seconds(dest)
+        if duration <= 0.0 and events:
+            duration = max(float(ev.get("t_end", 0.0)) for ev in events)
+
+        # 3) LLM — scoreboard prompt + timeline REPAIR + pacing + strict JSON lines
         llm = get_llm()
-        prompt = build_llm_prompt(ctx)
+        base_prompt = build_llm_prompt_scoreboard(ctx)
+        augmented = f"""{base_prompt}
 
-        if os.getenv("DEBUG_PROMPT", "0") == "1" or (debug_prompt and int(debug_prompt) == 1):
-            print("\n=== LLM PROMPT (run_id:", run_id, ") ===\n")
-            print(prompt)
-            print("\n=== END PROMPT ===\n")
-            out_dir = DATA_DIR / "tmp" / "prompts"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / f"prompt_{run_id}.txt").write_text(prompt, encoding="utf-8")
+---
+GAMEPLAY TIMELINE (raw; may include noise or invalid windows — you must repair):
+{raw_timeline_block}
 
-        text = llm.generate(
-            prompt,
+DATA QUALITY & REPAIR RULES
+- Treat the timeline above as noisy input.
+- Ignore any window where end <= start, end == 0, or duration < 0.5s.
+- Merge adjacent/overlapping windows with the same action label if within 1.0s.
+- Prefer representative labels in this order when merging:
+  touchdown > interception > fumble > sack > complete pass > incomplete pass > pass attempt > run > QB scramble > big hit > special teams results.
+- Never hallucinate team names, yardage, penalties, or scores that are not present in CONTEXT.
+- Constrain all times to [0, {duration:0.2f}].
+
+PACING RULES
+- Produce one commentary line for each repaired window at about (window_end + 0.30s).
+- If a gap between repaired windows is ≥ 2.0s, insert one brief filler line mid-gap (single short clause).
+- Keep lines punchy (broadcast play-by-play), max 1–2 exclamations total.
+
+OUTPUT FORMAT (strict):
+Return a JSON object with a single key "lines" whose value is an array of objects:
+  {{"lines":[{{"t_say": <seconds float>, "text": "<one sentence>"}}, ...]}}
+Constraints:
+- Use only the repaired windows you decided on.
+- t_say must be non-decreasing and within [0, {duration:0.2f}].
+- One sentence per line.
+- No extra keys. No code block fences.
+- If you cannot produce valid JSON, return: {{"lines":[{{"t_say":0.30,"text":"No commentary."}}]}}
+"""
+
+        model_out = llm.generate(
+            augmented,
             meta={"tone": tone_val, "bias": str(ctx.get("bias", "neutral")).lower(), "gender": gender_val},
         )
 
-        # 3) TTS selection
+        # Parse structured JSON -> stitched text for current TTS
+        parsed_lines: Optional[List[Dict[str, Any]]] = None
+        stitched_text = model_out
+        try:
+            obj = json.loads(model_out)
+            if isinstance(obj, dict) and isinstance(obj.get("lines"), list):
+                parsed_lines = [
+                    {
+                        "t_say": float(max(0.0, min(duration, float(l.get("t_say", 0.0))))),
+                        "text": str(l.get("text", "")).strip(),
+                    }
+                    for l in obj["lines"]
+                    if isinstance(l, dict) and str(l.get("text", "")).strip()
+                ]
+                parsed_lines.sort(key=lambda x: x["t_say"])
+                stitched_text = " ".join(l["text"] for l in parsed_lines)
+        except Exception:
+            parsed_lines = None
+
+        # 4) TTS selection
         if not voice_id:
             voice_id = VOICE_BY_TONE_GENDER.get(tone_val, {}).get(gender_val)
         if not voice_id:
@@ -255,7 +369,7 @@ def run_commentary_from_video(
 
         tts = get_tts()
         audio_mp3_path = tts.synth_to_file(
-            text,
+            stitched_text,
             DATA_DIR / "uploads" / "tts",
             tone=tone_val,
             bias=str(ctx.get("bias", "neutral")),
@@ -264,7 +378,7 @@ def run_commentary_from_video(
         )  # type: ignore[arg-type]
         audio_mp3 = Path(audio_mp3_path)
 
-        # 4) Mux (if not audio-only)
+        # 5) Mux (if not audio-only)
         video_out: Optional[Path] = None
         if not audio_only and audio_mp3.exists():
             audio_wav = _to_wav_from_mp3(audio_mp3)
@@ -279,7 +393,7 @@ def run_commentary_from_video(
 
         return CommentaryRunResponse(
             id=run_id,
-            text=text,
+            text=stitched_text,
             audio_url=(to_static_url(audio_mp3) if (audio_mp3 and audio_mp3.exists()) else None),
             video_url=(to_static_url(video_out) if video_out else None),
             meta={
@@ -293,11 +407,11 @@ def run_commentary_from_video(
                 "audio_only": audio_only,
                 "ocr_used_stub": bool(ocr.get("used_stub", False)),
                 "ocr_raw": ocr,
-                "prompt_file": f"/data/tmp/prompts/prompt_{run_id}.txt"
-                    if os.getenv("DEBUG_PROMPT", "0") == "1" or (debug_prompt and int(debug_prompt) == 1)
-                    else None,
-                **meta_extra,
-            },
+                "events_used": events,     # helpful for UI/debug
+                "llm_lines": parsed_lines, # final timed script (if parsed)
+                "device": device,
+                "ckpt": ckpt,
+            } | meta_extra,
         )
     except HTTPException:
         raise

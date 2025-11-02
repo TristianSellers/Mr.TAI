@@ -21,7 +21,7 @@ def run_inference(
     ckpt: Optional[str] = None,
 ):
     """
-    Single-window inference (kept for backward compatibility).
+    Single-window inference (kept for compatibility).
     Uses flow-based segment() to find one play and fuses to a one-liner TTS.
     """
     clip_id = clip_id or Path(video_path).stem
@@ -80,17 +80,23 @@ def run_inference_multi(
     device: str = "cpu",
     ckpt: Optional[str] = None,
     frames_per_window: int = 32,
+    segmentation: str = "peaks",  # "peaks" | "fixed"
 ):
     """
     Multi-segment inference:
-      - Splits the full clip into ~5s windows (segment_all)
-      - Classifies each window (gameplay-only)
-      - Builds a timed script with event lines and gap fillers
+      - Splits full clip into play-aware windows (segment_peaks) or fixed windows.
+      - Classifies each window (gameplay-only).
+      - Builds a timed script with event lines and gap fillers (script_builder).
     """
     clip_id = clip_id or Path(video_path).stem
 
     seg = EventSegmenter()
-    windows = seg.segment_all(video_path)
+    if segmentation == "fixed":
+        windows = seg.segment_all(video_path)
+    else:
+        # default: play-aware segmentation
+        windows = seg.segment_peaks(video_path)
+
     if not windows:
         raise ValueError("No event windows detected or video unreadable.")
 
@@ -115,7 +121,7 @@ def run_inference_multi(
 
     gp = GameplayPrediction(clip_id=clip_id, events=events)
 
-    # Optional (kept for future use): scoreboard & banner facts
+    # Optional: scoreboard & banner facts (for future yardage/score phrasing)
     sb = None
     if scoreboard_json and Path(scoreboard_json).exists():
         sb = ScoreboardFacts(**json.loads(Path(scoreboard_json).read_text()))
@@ -123,7 +129,7 @@ def run_inference_multi(
     if banner_json and Path(banner_json).exists():
         bn = BannerFacts(**json.loads(Path(banner_json).read_text()))
 
-    # Build script with timing; later we can inject yards from sb/bn per window
+    # Build paced script that respects event timing (segment_peaks drives pacing)
     tts_payload: Dict[str, Any] = {"clip_id": gp.clip_id, **build_script([asdict(e) for e in events])}
 
     save_json(
@@ -137,7 +143,6 @@ def run_inference_multi(
         out_json,
     )
 
-
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
@@ -150,6 +155,7 @@ if __name__ == "__main__":
     p.add_argument("--ckpt", default=None)
     p.add_argument("--multi", action="store_true", help="Use multi-segment inference")
     p.add_argument("--frames_per_window", type=int, default=32)
+    p.add_argument("--segmentation", choices=["peaks", "fixed"], default="peaks")
     args = p.parse_args()
 
     if args.multi:
@@ -162,6 +168,7 @@ if __name__ == "__main__":
             device=args.device,
             ckpt=args.ckpt,
             frames_per_window=args.frames_per_window,
+            segmentation=args.segmentation,
         )
     else:
         run_inference(
