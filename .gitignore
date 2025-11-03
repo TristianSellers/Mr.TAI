@@ -16,6 +16,8 @@ __pycache__/
 venv/
 .venv/
 env/
+venv312/
+.venv312/
 backend/venv/
 
 # Environment files
