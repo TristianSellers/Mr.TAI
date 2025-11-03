@@ -18,6 +18,8 @@ venv/
 venv312/
 *.venv312/
 env/
+venv312/
+.venv312/
 backend/venv/
 
 # Environment files
