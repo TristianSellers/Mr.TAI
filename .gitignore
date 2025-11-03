@@ -16,7 +16,7 @@ __pycache__/
 venv/
 .venv/
 venv312/
-.venv312/
+*.venv312/
 env/
 backend/venv/
 
