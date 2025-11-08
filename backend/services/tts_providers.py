@@ -214,9 +214,16 @@ class TypecastTTS:
 
 @lru_cache(maxsize=1)
 def get_tts():
-    provider = (os.getenv("TTS_PROVIDER", "elevenlabs") or "").lower()
+    # default to typecast now, not elevenlabs
+    provider = (os.getenv("TTS_PROVIDER") or "typecast").lower()
+
+    if provider == "typecast":
+        return TypecastTTS()   # <-- matches your class name
+
     if provider == "openai":
         return OpenAITTS()
-    if provider == "typecast":
-        return TypecastTTS()
-    return ElevenLabsTTS()
+
+    if provider == "elevenlabs":
+        return ElevenLabsTTS()
+
+    raise RuntimeError(f"Unknown TTS_PROVIDER: {provider!r}")
