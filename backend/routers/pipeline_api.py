@@ -227,6 +227,7 @@ def run_commentary_from_video(
 
         # 2) LLM — build prompt & (optionally) save it
         llm = get_llm()
+        print(">>> Using LLM provider:", type(llm).__name__)
         prompt = build_llm_prompt(ctx)
 
         if os.getenv("DEBUG_PROMPT", "0") == "1" or (debug_prompt and int(debug_prompt) == 1):
