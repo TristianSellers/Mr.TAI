@@ -1,68 +1,74 @@
 # backend/services/ocr_paddle.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Tuple, List, Sequence
+import json
+import logging
+import re
+import shlex
+import subprocess
+import time
+import uuid
+from rapidfuzz import fuzz
 from pathlib import Path
-import uuid, subprocess, shlex, re, time, logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from paddleocr import PaddleOCR
+from PIL import Image, ImageOps, ImageDraw
+import pytesseract  # <-- added back for Tesseract fallback
 
 try:
-    import cv2  # type: ignore
+    import cv2 as _cv2  # optional
 except Exception:
-    cv2 = None
+    _cv2 = None
+cv2 = _cv2
 
-from PIL import Image, ImageDraw, ImageOps, ImageFilter
+# EasyOCR (deep-learning OCR)
+try:
+    import easyocr as _easyocr  # type: ignore[import]
+except Exception:
+    _easyocr = None
 
-# ------------------------
-# Logging
-# ------------------------
+_easyocr_reader = None  # lazy-initialized EasyOCR reader
+
 log = logging.getLogger(__name__)
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ------------------------
-# Constants (reference full frame)
-# ------------------------
+# ---------------------------------------------------------------------------
+# Geometry / layout constants (multi-skin: MNP / TNP / SNP / DEFAULT)
+# ---------------------------------------------------------------------------
+
 REF_FRAME_W, REF_FRAME_H = 2047, 1155
 
-# Original/default bottom banner crop (fallback if preset not detected)
-SCOREBAR_BOX_DEFAULT = (0, 1080, 2047, 1155)
+SCOREBAR_BOX_DEFAULT: Tuple[int, int, int, int] = (0, 1080, 2047, 1155)
 
-# Top-right label region in FULL FRAME (your estimate)
-TOPRIGHT_BOX_REF = (1850, 30, 1950, 90)
-
-# Scoreboard crop windows per preset (in FULL FRAME coords, exclusive x2,y2 semantics)
 SCOREBAR_BOX_PRESETS: Dict[str, Tuple[int, int, int, int]] = {
     "MNP": (0, 1080, 2000, 1150),
     "TNP": (630, 1020, 1420, 1145),
     "SNP": (590, 1040, 1510, 1140),
-    "DEFAULT": (0, 1080, 2047, 1155),
+    "DEFAULT": SCOREBAR_BOX_DEFAULT,
 }
 
-# ------------------------
-# Canonicalization policy & ROI presets
-# ------------------------
 CANON_SIZE: Dict[str, Tuple[int, int]] = {
-    "MNP":     (2000, 72),
-    "TNP":     (800, 128),
-    "SNP":     (920, 100),
+    "MNP": (2000, 72),
+    "TNP": (800, 128),
+    "SNP": (920, 100),
     "DEFAULT": (1445, 72),
 }
 
-# FINAL ROI presets (x1,y1,x2,y2 exclusive) tuned for canonical sizes
 ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
     "MNP": {
         "away_team":  (550,  15,  626,  60),
         "away_score": (650,   0,  775,  70),
-        "home_team":  (975,  15,  1050, 60),
+        "home_team":  (975,  15, 1050,  60),
         "home_score": (825,   0,  950,  70),
-        "quarter":    (1350, 15,  1410, 60),
-        "clock":      (1410, 15,  1490, 60),
-        "down_dist":  (1675, 15,  1800, 60),
-        "yardline":   (1900, 15,  1950, 60),
-        "gameclock":  (1500, 15,  1550, 60),
+        "quarter":    (1350, 15, 1410,  60),
+        "clock":      (1410, 15, 1490,  60),
+        # NEW: split down / distance
+        "down":       (1675, 15, 1740,  60),
+        "distance":   (1760, 15, 1810,  60),
+        "yardline":   (1900, 15, 2000,  60),
+        "gameclock":  (1500, 15, 1600,  60),
     },
     "TNP": {
         "away_team":  (210,  25,  275,  75),
@@ -71,7 +77,9 @@ ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
         "home_score": (440,   5,  525,  75),
         "quarter":    (300,  75,  350, 120),
         "clock":      (350,  75,  450, 120),
-        "down_dist":  (175,  75,  300, 120),
+        # NEW: split down / distance
+        "down":       (175,  75,  233, 120),
+        "distance":   (247,  75,  300, 120),
         "yardline":   (525,  75,  600, 120),
         "gameclock":  (450,  75,  500, 120),
     },
@@ -82,7 +90,9 @@ ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
         "home_score": (570,  25,  660,  85),
         "quarter":    (340,  55,  375,  90),
         "clock":      (375,  55,  450,  90),
-        "down_dist":  (375,  20,  500,  50),
+        # NEW: split down / distance
+        "down":       (375,  20,  433,  50),
+        "distance":   (447,  20,  490,  50),
         "yardline":   (485,  55,  525,  90),
         "gameclock":  (450,  55,  485,  90),
     },
@@ -91,121 +101,57 @@ ROI_PRESETS_CANON: Dict[str, Dict[str, Tuple[int, int, int, int]]] = {
         "home_team":  (670,   10,  755,  45),
         "away_score": (490,   10,  560,  55),
         "home_score": (575,   10,  645,  55),
-        "quarter":    (960,   10, 1010,  45),
-        "clock":      (1010,  10, 1090,  45),
-        "down_dist":  (1175,  10, 1325,  45),
-        "yardline":   (1350,  10, 1425,  45),
-        "gameclock":  (1100,  10, 1150,  45),
+        "quarter":    (960,   10, 1010,  55),
+        "clock":      (1010,  10, 1090,  55),
+        # NEW: split down / distance
+        "down":       (1175,  10, 1240,  55),
+        "distance":   (1260,  10, 1325,  55),
+        "yardline":   (1350,  10, 1425,  55),
+        "gameclock":  (1100,  10, 1150,  55),
     },
 }
 
-# ------------------------
-# OCR singleton
-# ------------------------
-_OCR_SINGLETON: Optional[PaddleOCR] = None
 
-def _ocr_init() -> PaddleOCR:
-    global _OCR_SINGLETON
-    if _OCR_SINGLETON is None:
-        _OCR_SINGLETON = PaddleOCR(use_angle_cls=False, lang='en', show_log=False)
-    return _OCR_SINGLETON
+# Top-right label region in FULL FRAME (used for skin detection)
+TOPRIGHT_BOX_REF: Tuple[int, int, int, int] = (1850, 30, 1950, 90)
 
-# ------------------------
-# Utilities
-# ------------------------
+# ---------------------------------------------------------------------------
+# ffmpeg frame grab
+# ---------------------------------------------------------------------------
+
+
 def _run_ffmpeg_grab(src: Path, ts: float, out_png: Path) -> bool:
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    cmd = f'ffmpeg -y -v error -ss {ts:.3f} -i {shlex.quote(str(src))} -frames:v 1 {shlex.quote(str(out_png))}'
+    cmd = (
+        f"ffmpeg -y -v error -ss {ts:.3f} "
+        f"-i {shlex.quote(str(src))} -frames:v 1 {shlex.quote(str(out_png))}"
+    )
+    log.info("[_run_ffmpeg_grab] %s", cmd)
     subprocess.run(cmd, shell=True, check=False)
     return out_png.exists()
 
+
 def _grab_frame(video_path: str, ts: float, out_png: Path) -> Path:
     src = Path(video_path)
-    if cv2 is not None:
-        cap = cv2.VideoCapture(str(src))
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, ts * 1000.0))
-            ok, frame = cap.read()
-            cap.release()
-            if ok and frame is not None:
-                rgb = frame[:, :, ::-1]
-                Image.fromarray(rgb).save(out_png)
-                return out_png
-    if _run_ffmpeg_grab(src, ts, out_png):
-        return out_png
-    raise RuntimeError(f"Could not grab frame at t={ts:.3f}s")
+    if not src.exists():
+        raise FileNotFoundError(f"Video not found: {src}")
+    log.info("[_grab_frame] Grabbing frame at t=%.3fs from %s", ts, src)
+    ok = _run_ffmpeg_grab(src, ts, out_png)
+    if not ok:
+        raise RuntimeError(f"Could not grab frame at t={ts:.3f}s")
+    log.info("[_grab_frame] Saved frame to %s", out_png)
+    return out_png
 
-def _scale_box_to_frame(box: Tuple[int, int, int, int], w: int, h: int) -> Tuple[int, int, int, int]:
-    lx, ty, rx, by = box
-    sx = w / REF_FRAME_W
-    sy = h / REF_FRAME_H
-    return (int(lx * sx), int(ty * sy), int(rx * sx), int(by * sy))
 
-def _crop_rect_safe(pil: Image.Image, x0: int, y0: int, x1: int, y1: int) -> Image.Image:
-    if x1 < x0: x0, x1 = x1, x0
-    if y1 < y0: y0, y1 = y1, y0
-    w, h = pil.size
-    x0 = max(0, min(x0, w - 1))
-    y0 = max(0, min(y0, h - 1))
-    x1 = max(x0 + 1, min(x1, w))
-    y1 = max(y0 + 1, min(y1, h))
-    return pil.crop((x0, y0, x1, y1))
+# ---------------------------------------------------------------------------
+# Basic image utilities
+# ---------------------------------------------------------------------------
 
-def _prep_gray_bw(pil: Image.Image, thresh: int = 160, invert: bool = False) -> Image.Image:
-    g = pil.convert("L")
-    table = [0] * (thresh + 1) + [255] * (256 - (thresh + 1))
-    bw = g.point(table, mode="L")
-    if invert:
-        bw = ImageOps.invert(bw)
-    return bw
-
-# ------------------------
-# Visualization helpers
-# ------------------------
-def _draw_frame_scorebar_outline(frame_png: Path, full_box: Tuple[int, int, int, int], out_png: Path) -> None:
-    with Image.open(frame_png) as im:
-        w, h = im.size
-        lx, ty, rx, by = _scale_box_to_frame(full_box, w, h)
-        vis = im.copy()
-        d = ImageDraw.Draw(vis)
-        d.rectangle((lx, ty, rx, by), outline="lime", width=4)
-        out_png.parent.mkdir(parents=True, exist_ok=True)
-        vis.save(out_png)
-
-def _viz_rois_on_scorebar(scorebar_png: Path, ref_size: Tuple[int, int], roi_map: Dict[str, Tuple[int,int,int,int]], out_png: Path) -> None:
-    with Image.open(scorebar_png) as sb:
-        w, h = sb.size
-        sx = w / float(ref_size[0])
-        sy = h / float(ref_size[1])
-
-        vis = sb.copy()
-        d = ImageDraw.Draw(vis)
-        colors = {
-            "away_team":  "orange",
-            "home_team":  "orange",
-            "away_score": "lime",
-            "home_score": "lime",
-            "quarter":    "deepskyblue",
-            "clock":      "deepskyblue",
-            "down_dist":  "violet",
-            "yardline":   "violet",
-            "gameclock":  "deepskyblue",
-        }
-        for key, (x0, y0, x1, y1) in roi_map.items():
-            X0, Y0 = int(round(x0 * sx)), int(round(y0 * sy))
-            X1, Y1 = int(round(x1 * sx)), int(round(y1 * sy))
-            d.rectangle((X0, Y0, X1, Y1), outline=colors.get(key, "yellow"), width=3)
-            d.text((X0 + 4, max(0, Y0 - 14)), key, fill=colors.get(key, "yellow"))
-        out_png.parent.mkdir(parents=True, exist_ok=True)
-        vis.save(out_png)
-
-# ------------------------
-# Canonicalized preprocessor
-# ------------------------
 def _ensure_np_rgb(img: Any) -> np.ndarray:
     if isinstance(img, Image.Image):
-        return np.array(img.convert("RGB"))
-    arr = img
+        arr = np.array(img.convert("RGB"))
+    else:
+        arr = img
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
     if arr.shape[-1] == 4:
@@ -214,21 +160,12 @@ def _ensure_np_rgb(img: Any) -> np.ndarray:
         arr = arr.astype(np.uint8)
     return arr
 
-def _clamp_box_exclusive(box: Tuple[int, int, int, int], W: int, H: int) -> Tuple[int, int, int, int]:
-    x1, y1, x2, y2 = box
-    x1 = max(0, min(x1, W))
-    y1 = max(0, min(y1, H))
-    x2 = max(0, min(x2, W))
-    y2 = max(0, min(y2, H))
-    if x2 < x1: x1, x2 = x2, x1
-    if y2 < y1: y1, y2 = y2, y1
-    if x2 == x1 and x2 < W: x2 = x1 + 1
-    if y2 == y1 and y2 < H: y2 = y1 + 1
-    if x2 == x1 and x2 == W and x1 > 0: x1 -= 1
-    if y2 == y1 and y2 == H and y1 > 0: y1 -= 1
-    return (x1, y1, x2, y2)
 
-def _scale_fullframe_box_to_actual(full_box_ref: Tuple[int, int, int, int], actual_w: int, actual_h: int) -> Tuple[int, int, int, int]:
+def _scale_fullframe_box_to_actual(
+    full_box_ref: Tuple[int, int, int, int],
+    actual_w: int,
+    actual_h: int,
+) -> Tuple[int, int, int, int]:
     lx, ty, rx, by = full_box_ref
     sx = actual_w / float(REF_FRAME_W)
     sy = actual_h / float(REF_FRAME_H)
@@ -236,7 +173,25 @@ def _scale_fullframe_box_to_actual(full_box_ref: Tuple[int, int, int, int], actu
     Y1 = int(round(ty * sy))
     X2 = int(round(rx * sx))
     Y2 = int(round(by * sy))
-    return (X1, Y1, X2, Y2)
+    return X1, Y1, X2, Y2
+
+
+def _clamp_box_exclusive(
+    box: Tuple[int, int, int, int],
+    W: int,
+    H: int,
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    x1 = max(0, min(x1, W))
+    y1 = max(0, min(y1, H))
+    x2 = max(0, min(x2, W))
+    y2 = max(0, min(y2, H))
+    if x2 <= x1:
+        x2 = min(W, x1 + 1)
+    if y2 <= y1:
+        y2 = min(H, y1 + 1)
+    return x1, y1, x2, y2
+
 
 def crop_scorebar(full_frame: Any, skin: str) -> np.ndarray:
     t0 = time.perf_counter()
@@ -250,11 +205,17 @@ def crop_scorebar(full_frame: Any, skin: str) -> np.ndarray:
     x1, y1, x2, y2 = _scale_fullframe_box_to_actual(box_ref, W, H)
     x1, y1, x2, y2 = _clamp_box_exclusive((x1, y1, x2, y2), W, H)
     crop = img[y1:y2, x1:x2, :].copy()
-
-    log.info("[crop_scorebar][%s] box=%s -> crop %dx%d in %.3f ms",
-             skin, (x1, y1, x2, y2), crop.shape[1], crop.shape[0],
-             (time.perf_counter() - t0) * 1000.0)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    log.info(
+        "[crop_scorebar][%s] box=%s -> crop %dx%d in %.3f ms",
+        skin,
+        (x1, y1, x2, y2),
+        crop.shape[1],
+        crop.shape[0],
+        dt_ms,
+    )
     return crop
+
 
 def to_canonical(scorebar: Any, skin: str) -> np.ndarray:
     t0 = time.perf_counter()
@@ -262,7 +223,6 @@ def to_canonical(scorebar: Any, skin: str) -> np.ndarray:
     if skin not in CANON_SIZE:
         skin = "DEFAULT"
     target_w, target_h = CANON_SIZE[skin]
-
     sb = _ensure_np_rgb(scorebar)
     if cv2 is not None:
         canon = cv2.resize(sb, (target_w, target_h), interpolation=cv2.INTER_AREA)
@@ -271,21 +231,22 @@ def to_canonical(scorebar: Any, skin: str) -> np.ndarray:
         canon = np.array(
             pil.resize((target_w, target_h), resample=Image.Resampling.BICUBIC)
         )
-
-    log.info("[to_canonical][%s] -> %dx%d in %.3f ms",
-             skin, target_w, target_h, (time.perf_counter() - t0) * 1000.0)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    log.info(
+        "[to_canonical][%s] -> %dx%d in %.3f ms",
+        skin,
+        target_w,
+        target_h,
+        dt_ms,
+    )
     return canon
+
 
 def extract_rois(
     bar_canon: Any,
     skin: str,
-    roi_names: Optional[List[str]] = None,
     pad: int = 2,
-    roi_pad_overrides: Optional[Dict[str, int]] = None,
 ) -> Dict[str, np.ndarray]:
-    """
-    Extract canonical ROIs. Uses default ±pad, with optional per-ROI overrides.
-    """
     t0 = time.perf_counter()
     skin = (skin or "DEFAULT").upper()
     roi_map = ROI_PRESETS_CANON.get(skin) or ROI_PRESETS_CANON["DEFAULT"]
@@ -293,648 +254,432 @@ def extract_rois(
     img = _ensure_np_rgb(bar_canon)
     H, W, _ = img.shape
 
-    names = roi_names if roi_names else list(roi_map.keys())
     patches: Dict[str, np.ndarray] = {}
-    roi_pad_overrides = roi_pad_overrides or {}
-
-    for name in names:
-        if name not in roi_map:
-            continue
-        x1, y1, x2, y2 = roi_map[name]
-        my_pad = roi_pad_overrides.get(name, pad)
-        x1p = x1 - my_pad; y1p = y1 - my_pad
-        x2p = x2 + my_pad; y2p = y2 + my_pad
-        x1p, y1p, x2p, y2p = _clamp_box_exclusive((x1p, y1p, x2p, y2p), W, H)
+    for name, (x1, y1, x2, y2) in roi_map.items():
+        x1p = max(0, x1 - pad)
+        y1p = max(0, y1 - pad)
+        x2p = min(W, x2 + pad)
+        y2p = min(H, y2 + pad)
         patch = img[y1p:y2p, x1p:x2p, :].copy()
         patches[name] = patch
 
-    log.info("[extract_rois][%s] %d patches in %.3f ms",
-             skin, len(patches), (time.perf_counter() - t0) * 1000.0)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    log.info(
+        "[extract_rois][%s] %d patches in %.3f ms",
+        skin,
+        len(patches),
+        dt_ms,
+    )
     return patches
 
-def draw_roi_overlay(bar_canon: Any, skin: str, out_path: str) -> str:
+
+# ---------------------------------------------------------------------------
+# Tesseract helpers (for clock fallback)
+# ---------------------------------------------------------------------------
+
+def _tess_cfg(whitelist: str, psm: int = 7) -> str:
+    """
+    Build a Tesseract config string with a character whitelist.
+    PSM 7: treat as a single text line.
+    """
+    return f'--psm {psm} -c tessedit_char_whitelist={whitelist}'
+
+
+def _resize_for_ocr(pil_img: Image.Image, scale: int = 3) -> Image.Image:
+    """
+    Upscale small crops so Tesseract has more pixels to work with.
+    """
+    w, h = pil_img.size
+    if w * scale < 300 and h * scale < 150:
+        return pil_img.resize(
+            (max(1, w * scale), max(1, h * scale)),
+            resample=Image.Resampling.BICUBIC,
+        )
+    return pil_img
+
+
+def _ocr_raw(
+    pil_img: Image.Image,
+    whitelist: Optional[str] = None,
+    psm: int = 7,
+) -> str:
+    """
+    Run Tesseract on a PIL image, optional whitelist, return stripped text.
+    """
+    img = _resize_for_ocr(pil_img)
+    config = ""
+    if whitelist is not None:
+        config = _tess_cfg(whitelist, psm=psm)
+    text = pytesseract.image_to_string(img, config=config)
+    return (text or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# EasyOCR helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_easyocr_reader():
+    """
+    Lazy-initialize a global EasyOCR reader.
+    Returns None if EasyOCR is not available.
+    """
+    global _easyocr_reader
+    if _easyocr is None:
+        log.warning("[easyocr] EasyOCR library not available")
+        return None
+    if _easyocr_reader is None:
+        log.info("[easyocr] Initializing EasyOCR reader (en, gpu=False)")
+        _easyocr_reader = _easyocr.Reader(["en"], gpu=False)
+    return _easyocr_reader
+
+
+def _easy_ocr_single(
+    pil_img: Image.Image,
+    *,
+    allow_chars: Optional[str] = None,
+    detail: bool = False,
+    textcase: str = "upper",
+) -> str:
+    """
+    Run EasyOCR on a PIL image and return a single combined text string.
+
+    - allow_chars: if given, restricts allowed characters.
+    - detail: if True, return the full EasyOCR results list as a string.
+    - textcase: "upper", "lower", or "none".
+    """
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return ""
+
+    np_img = np.array(pil_img.convert("RGB"))
+
+    kwargs: Dict[str, Any] = {"detail": 0, "paragraph": False}
+    if allow_chars is not None:
+        kwargs["allowlist"] = allow_chars
+
+    result = reader.readtext(np_img, **kwargs)  # with detail=0 -> list[str]
+
+    if detail:
+        # If caller wants raw detail, just stringify it
+        return str(result)
+
+    pieces = [s for s in result if isinstance(s, str)]
+    txt = "".join(pieces).strip()
+
+    if textcase == "upper":
+        txt = txt.upper()
+    elif textcase == "lower":
+        txt = txt.lower()
+
+    return txt
+
+
+def _easyocr_text(
+    pil_img: Image.Image,
+    allowlist: Optional[str] = None,
+) -> str:
+    """
+    Run EasyOCR on a PIL image and return combined text.
+
+    - Upscales small images to help recognition
+    - Uses allowlist when provided
+    """
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return ""
+
+    img = pil_img.convert("RGB")
+
+    # Upscale small patches (scoreboard bits are tiny)
+    if img.width < 200 or img.height < 80:
+        scale = 4
+        img = img.resize(
+            (img.width * scale, img.height * scale),
+            resample=Image.Resampling.BICUBIC,
+        )
+
+    arr = np.array(img)
+    kwargs: Dict[str, Any] = {"detail": 0, "paragraph": False}
+    if allowlist is not None:
+        kwargs["allowlist"] = allowlist
+
+    results = reader.readtext(arr, **kwargs)
+    if not results:
+        return ""
+
+    texts = [r.strip() for r in results if isinstance(r, str) and r.strip()]
+    return " ".join(texts)
+
+
+def _ocr_team(pil_img: Optional[Image.Image]) -> Optional[str]:
+    """OCR a team abbreviation (letters only) using EasyOCR."""
+    if pil_img is None:
+        return None
+    txt = _easyocr_text(pil_img, allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    log.debug("[_ocr_team][easyocr] raw='%s'", txt)
+    s = re.sub(r"[^A-Z]", "", txt.upper())
+    if not s:
+        return None
+    return s[:4]
+
+
+def _ocr_digits_int(pil_img: Optional[Image.Image]) -> Optional[int]:
+    """
+    OCR a small integer (score, down, distance, etc.) using
+    EasyOCR as primary and Tesseract as a sanity check.
+
+    This also handles the common 1 ↔ 7 confusion we see in
+    your scoreboard fonts.
+    """
+    if pil_img is None:
+        return None
+
+    # ---- EasyOCR pass ----
+    txt_easy = _easyocr_text(pil_img, allowlist="0123456789")
+    txt_easy = (txt_easy or "").strip()
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("[_ocr_digits_int][easyocr] raw='%s'", txt_easy)
+
+    m_easy = re.search(r"\d{1,2}", txt_easy)
+    val_easy: Optional[int] = None
+    if m_easy:
+        try:
+            val_easy = int(m_easy.group(0))
+        except Exception:
+            val_easy = None
+
+    # ---- Tesseract pass ----
+    txt_tess = _ocr_raw(pil_img, whitelist="0123456789", psm=7)
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("[_ocr_digits_int][tesseract] raw='%s'", txt_tess)
+
+    m_tess = re.search(r"\d{1,2}", txt_tess or "")
+    val_tess: Optional[int] = None
+    if m_tess:
+        try:
+            val_tess = int(m_tess.group(0))
+        except Exception:
+            val_tess = None
+
+    # ---- Combine results ----
+    if val_easy is None and val_tess is None:
+        return None
+    if val_easy is not None and val_tess is None:
+        return val_easy
+    if val_tess is not None and val_easy is None:
+        return val_tess
+
+    # both not None here
+    assert val_easy is not None and val_tess is not None
+
+    # If they agree, we're happy
+    if val_easy == val_tess:
+        return val_easy
+
+    # Special-case the 1 vs 7 confusion:
+    # we've seen EasyOCR call a 7 as 1, while Tesseract gets 7.
+    if {val_easy, val_tess} == {1, 7}:
+        return 7
+
+    # Otherwise, trust EasyOCR as the primary
+    return val_easy
+
+def _ocr_clock(pil_img: Optional[Image.Image]) -> Optional[str]:
+    """
+    OCR a game clock like MM:SS.
+    Uses EasyOCR + Tesseract fallback with robust normalization.
+    """
+    if pil_img is None:
+        return None
+
+    # EasyOCR attempt
+    raw_easy = _easy_ocr_single(
+        pil_img,
+        allow_chars="0123456789:",
+        detail=False,
+        textcase="upper",
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("[_ocr_clock][easyocr] raw='%s'", raw_easy)
+
+    clk = _norm_clock_flexible(raw_easy)
+    if clk:
+        return clk
+
+    # Fallback to Tesseract
+    raw_tess = _ocr_raw(pil_img, whitelist="0123456789:", psm=7)
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("[_ocr_clock][tesseract] raw='%s'", raw_tess)
+
+    clk2 = _norm_clock_flexible(raw_tess)
+    return clk2
+
+
+
+def _ocr_generic_text(pil_img: Optional[Image.Image]) -> str:
+    """OCR generic text using EasyOCR (no whitelist)."""
+    if pil_img is None:
+        return ""
+    txt = _easyocr_text(pil_img, allowlist=None)
+    log.debug("[_ocr_generic_text][easyocr] raw='%s'", txt)
+    return txt
+
+
+# ---------------------------------------------------------------------------
+# Skin auto-detection from top-right label (EasyOCR)
+# ---------------------------------------------------------------------------
+
+
+def _detect_profile_from_topright(
+    full_pil: Image.Image,
+    *,
+    viz_dir: Optional[Path] = None,
+) -> str:
+    """
+    Crop the top-right label region and OCR it with EasyOCR to decide
+    which skin is active (MNP / TNP / SNP). Falls back to DEFAULT.
+    """
+    img = _ensure_np_rgb(full_pil)
+    H, W, _ = img.shape
+
+    # Scale reference box to actual frame
+    x1, y1, x2, y2 = _scale_fullframe_box_to_actual(TOPRIGHT_BOX_REF, W, H)
+
+    # Expand the box a bit to be safe
+    w_box = x2 - x1
+    h_box = y2 - y1
+    pad_x = int(w_box * 0.7) or 10
+    pad_y = int(h_box * 0.7) or 10
+
+    x1 -= pad_x
+    x2 += pad_x
+    y1 -= pad_y
+    y2 += pad_y
+
+    x1, y1, x2, y2 = _clamp_box_exclusive((x1, y1, x2, y2), W, H)
+    patch_np = img[y1:y2, x1:x2, :]
+    patch_pil = Image.fromarray(patch_np)
+
+    # Light preprocessing to help EasyOCR
+    proc = ImageOps.autocontrast(ImageOps.grayscale(patch_pil)).convert("RGB")
+
+    if viz_dir is not None:
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        patch_pil.save(viz_dir / "topright_label_raw.png")
+        proc.save(viz_dir / "topright_label_proc.png")
+
+    txt = _easyocr_text(
+        proc,
+        allowlist="MNPTSABCDEFGHIJKLOQRUVWXYZ",
+    )
+    txt_u = txt.strip().upper()
+    letters = re.sub(r"[^A-Z]", "", txt_u)
+    log.info(
+        "[detect_profile][easyocr] raw='%s', letters='%s', box=%s",
+        txt_u,
+        letters,
+        (x1, y1, x2, y2),
+    )
+
+    if not letters:
+        log.info("[detect_profile] no OCR letters, using DEFAULT")
+        return "DEFAULT"
+
+    # First, try exact substring
+    for label in ("MNP", "TNP", "SNP"):
+        if label in letters:
+            log.info("[detect_profile] exact match -> %s", label)
+            return label
+
+    # Fallback: fuzzy 3-char matching (>=2/3 chars)
+    candidates = ["MNP", "TNP", "SNP"]
+    best_label = None
+    best_score = -1
+
+    for i in range(0, max(0, len(letters) - 2)):
+        seg = letters[i : i + 3]
+        if len(seg) < 3:
+            continue
+        for cand in candidates:
+            score = sum(seg[j] == cand[j] for j in range(3))
+            if score > best_score:
+                best_score = score
+                best_label = cand
+
+    if best_label is not None and best_score >= 2:
+        log.info(
+            "[detect_profile] fuzzy match -> %s (score=%d, letters='%s')",
+            best_label,
+            best_score,
+            letters,
+        )
+        return best_label
+
+    log.info(
+        "[detect_profile] no confident match, using DEFAULT (letters='%s')", letters
+    )
+    return "DEFAULT"
+
+
+# ---------------------------------------------------------------------------
+# Debug drawing
+# ---------------------------------------------------------------------------
+
+
+def _draw_roi_debug(bar_canon: np.ndarray, skin: str) -> Image.Image:
     skin = (skin or "DEFAULT").upper()
     roi_map = ROI_PRESETS_CANON.get(skin) or ROI_PRESETS_CANON["DEFAULT"]
 
-    img = _ensure_np_rgb(bar_canon)
-    pil = Image.fromarray(img)
-    d = ImageDraw.Draw(pil)
+    img = bar_canon.copy()
 
-    color_map = {
-        "away_team":  "orange",
-        "home_team":  "orange",
-        "away_score": "lime",
-        "home_score": "lime",
-        "quarter":    "deepskyblue",
-        "clock":      "deepskyblue",
-        "down_dist":  "violet",
-        "yardline":   "violet",
-        "gameclock":  "deepskyblue",
-    }
-
-    for key, (x1, y1, x2, y2) in roi_map.items():
-        x2d = max(x1, x2 - 1)
-        y2d = max(y1, y2 - 1)
-        col = color_map.get(key, "yellow")
-        d.rectangle((x1, y1, x2d, y2d), outline=col, width=3)
-        d.text((x1 + 4, max(0, y1 - 14)), key, fill=col)
-
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    pil.save(out_path)
-    return out_path
-
-# ------------------------
-# Paddle OCR helpers
-# ------------------------
-def _ocr_text(ocr: PaddleOCR, pil_img: Image.Image) -> str:
-    try:
-        arr = np.array(pil_img.convert("RGB"))
-        res = ocr.ocr(arr, cls=False)
-    except Exception:
-        return ""
-    if not res or not isinstance(res, list) or not res[0]:
-        return ""
-    lines = res[0]
-    try:
-        best = max(lines, key=lambda ln: (ln[1][1] if isinstance(ln, list) and len(ln) > 1 else 0.0))
-        return (best[1][0] or "").strip()
-    except Exception:
-        return ""
-
-def _ocr_letters_strict(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optional[Path] = None, stamp: str = "") -> str:
-    cand: List[Tuple[float, str]] = []
-    idx = 0
-    for scale in (2, 3):
-        im = pil_img.resize((max(1, pil_img.width * scale), max(1, pil_img.height * scale)))
-        for thr in (150, 165, 180, 195):
-            for inv in (False, True):
-                bw = _prep_gray_bw(im, thresh=thr, invert=inv)
-                txt = _ocr_text(ocr, bw)
-                txt2 = re.sub(r"[^A-Z]", "", txt.upper())
-                if txt2:
-                    score = len(txt2) + (0.1 if re.search(r"[A-Za-z]", txt) else 0.0)
-                    cand.append((score, txt2))
-                if viz_dir:
-                    try:
-                        bw.save(viz_dir / f"topright_bw_{stamp}_{idx}.png")
-                    except Exception:
-                        pass
-                idx += 1
-    if not cand:
-        txt = _ocr_text(ocr, pil_img)
-        return re.sub(r"[^A-Z]", "", (txt or "").upper())
-    cand.sort(key=lambda t: t[0], reverse=True)
-    return cand[0][1]
-
-# ------------------------
-# Digit OCR (ensemble) + confidences (scores)
-# ------------------------
-def _only_digits(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
-
-def _clahe(gray: np.ndarray) -> np.ndarray:
-    if cv2 is None:
-        return gray
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-def _ocr_digits_ensemble(
-    ocr: PaddleOCR,
-    pil_img: Image.Image,
-    viz_dir: Optional[Path] = None,
-    tag: str = "",
-    extra_images: Optional[List[Image.Image]] = None
-) -> str:
-    cands: List[Tuple[int, str]] = []
-    idx = 0
-    bases: List[Image.Image] = []
-    for scale in (2, 3, 4):
-        bases.append(pil_img.resize((max(1, pil_img.width * scale), max(1, pil_img.height * scale))))
     if cv2 is not None:
-        im3 = pil_img.resize((max(1, pil_img.width * 3), max(1, pil_img.height * 3)))
-        g3 = np.array(im3.convert("L"))
-        g3c = _clahe(g3)
-        bases.append(Image.fromarray(g3c).convert("RGB"))
-    if extra_images:
-        bases.extend(extra_images)
+        for name, (x1, y1, x2, y2) in roi_map.items():
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 1)
+            cv2.putText(
+                img,
+                name,
+                (x1, max(10, y1 - 2)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (0, 255, 0),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+        return Image.fromarray(img)
 
-    for im in bases:
-        for thr in (110, 130, 150, 170, 190, 210, 230):
-            for inv in (False, True):
-                bw = _prep_gray_bw(im, thresh=thr, invert=inv)
-                txt = _ocr_text(ocr, bw)
-                dg = _only_digits(txt)
-                if dg:
-                    score = (len(dg) * 10) + (0 if inv else 1)
-                    cands.append((score, dg))
-                if viz_dir:
-                    try:
-                        bw.save((viz_dir / f"score_ens_{tag}_{idx}.png"))
-                    except Exception:
-                        pass
-                idx += 1
-    if cands:
-        cands.sort(key=lambda t: t[0], reverse=True)
-        return cands[0][1]
-    return ""
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+    for name, (x1, y1, x2, y2) in roi_map.items():
+        draw.rectangle([x1, y1, x2, y2], outline="green", width=1)
+        draw.text((x1, max(0, y1 - 8)), name, fill="green")
+    return pil_img
 
-# ---------- Template fallback helpers (with cache + confidence) ----------
-_TPL_CACHE: Dict[str, List[Tuple[str, np.ndarray]]] = {}
 
-def _load_digit_templates(skin: str) -> List[Tuple[str, np.ndarray]]:
-    if skin in _TPL_CACHE:
-        return _TPL_CACHE[skin]
-    base = Path("data/ocr_templates") / skin.upper()
-    tpls: List[Tuple[str, np.ndarray]] = []
-    if base.exists():
-        for d in map(str, range(10)):
-            p = base / f"{d}.png"
-            if p.exists():
-                im = Image.open(p).convert("L")
-                arr = np.array(im)
-                tpls.append((d, arr))
-    _TPL_CACHE[skin] = tpls
-    return tpls
+# ---------------------------------------------------------------------------
+# Normalization and parsing helpers
+# ---------------------------------------------------------------------------
 
-def _prep_binary_variants_gray(gray: np.ndarray) -> List[np.ndarray]:
-    out: List[np.ndarray] = []
-    if cv2 is None:
-        pil = Image.fromarray(gray)
-        for thr in (120, 150, 180):
-            bw = np.array(_prep_gray_bw(pil, thresh=thr, invert=False))
-            out.append(bw); out.append(255 - bw)
-        return out
-    gray2 = _clahe(gray)
-    for base in (gray, gray2):
-        _, otsu = cv2.threshold(base, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        out += [otsu, cv2.bitwise_not(otsu)]
-        ada = cv2.adaptiveThreshold(base, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 11, 2)
-        out += [ada, cv2.bitwise_not(ada)]
-    return out
-
-def _morph_tidy(bw: np.ndarray) -> np.ndarray:
-    if cv2 is None:
-        return bw
-    k1 = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
-    k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
-    closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k1, iterations=1)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k2, iterations=1)
-    return opened
-
-def _norm_xcorr(a: np.ndarray, b: np.ndarray) -> float:
-    A = a.astype(np.float32); B = b.astype(np.float32)
-    A = (A - A.mean()) / (A.std() + 1e-6)
-    B = (B - B.mean()) / (B.std() + 1e-6)
-    return float((A * B).mean())
-
-def _resize_like(img: np.ndarray, target_hw: Sequence[int]) -> np.ndarray:
-    th, tw = int(target_hw[0]), int(target_hw[1])
-    if img.shape[0] == th and img.shape[1] == tw:
-        return img
-    if cv2 is None:
-        return np.array(Image.fromarray(img).resize((tw, th), resample=Image.Resampling.BICUBIC))
-    return cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
-
-def _best_split_index(bw: np.ndarray) -> int:
-    H, W = bw.shape
-    fg = (bw < 128).astype(np.uint8)
-    col_sums = fg.sum(axis=0)
-    lo = int(0.30 * W)
-    hi = int(0.70 * W)
-    if hi <= lo:
-        return W // 2
-    segment = col_sums[lo:hi]
-    idx = int(np.argmin(segment))
-    return lo + idx
-
-def _template_match_digits_with_conf(pil_img: Image.Image, skin: str, max_digits: int = 2) -> Optional[Tuple[str, float]]:
-    tpls = _load_digit_templates(skin)
-    if not tpls:
-        return None
-
-    gray = np.array(pil_img.convert("L"))
-    bins = [_morph_tidy(bw) for bw in _prep_binary_variants_gray(gray)]
-
-    def score_digit(glyph: np.ndarray) -> Tuple[str, float]:
-        best_s, best_d = -1.0, "0"
-        for d, tpl in tpls:
-            g = _resize_like(glyph, tpl.shape[:2])
-            s = _norm_xcorr(g, tpl)
-            s = max(s, _norm_xcorr(255 - g, tpl))
-            if s > best_s:
-                best_s, best_d = s, d
-        return best_d, float(max(0.0, min(1.0, (best_s + 1.0) * 0.5)))
-
-    candidates: List[Tuple[float, str]] = []
-
-    for bw in bins:
-        d1, s1 = score_digit(bw)
-        candidates.append((s1, d1))
-        if max_digits >= 2:
-            mid = _best_split_index(bw)
-            for shift in (-6, -3, 0, 3, 6):
-                m = int(np.clip(mid + shift, 1, bw.shape[1] - 1))
-                left, right = bw[:, :m], bw[:, m:]
-                if left.size == 0 or right.size == 0:
-                    continue
-                dL, sL = score_digit(left)
-                dR, sR = score_digit(right)
-                candidates.append((min(sL, sR), dL + dR))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_s, best_d = candidates[0]
-    return (best_d, best_s)
-
-# ---------- Polarity/illumination helpers ----------
-def _illumination_normalize(gray: np.ndarray) -> np.ndarray:
-    if cv2 is not None:
-        blur = cv2.GaussianBlur(gray, (11, 11), 3)
-        norm = (gray.astype(np.float32) / (blur.astype(np.float32) + 1e-6)) * 128.0
-        norm = np.clip(norm, 0, 255).astype(np.uint8)
-        return norm
-    pil = Image.fromarray(gray)
-    blur = np.array(pil.filter(ImageFilter.GaussianBlur(radius=3)))
-    norm = (gray.astype(np.float32) / (blur.astype(np.float32) + 1e-6)) * 128.0
-    return np.clip(norm, 0, 255).astype(np.uint8)
-
-def _edge_energy(bw: np.ndarray) -> float:
-    if cv2 is None:
-        return float(np.std(bw))
-    e = cv2.Canny(bw, 50, 150)
-    return float(e.sum()) / 255.0
-
-def _central_occupancy(bw: np.ndarray) -> float:
-    H, W = bw.shape
-    x0, x1 = int(0.25*W), int(0.75*W)
-    y0, y1 = int(0.25*H), int(0.75*H)
-    roi = bw[y0:y1, x0:x1]
-    if roi.size == 0:
-        return 0.0
-    fg = (roi < 128).sum()
-    return float(fg) / float(roi.size)
-
-def _choose_polarity(gray: np.ndarray) -> np.ndarray:
-    variants = _prep_binary_variants_gray(gray)
-    best_score = -1.0
-    best = variants[0]
-    for v in variants:
-        bw = v if v.mean() > 127 else (255 - v)
-        score = 0.7 * _edge_energy(bw) + 0.3 * _central_occupancy(bw)
-        if score > best_score:
-            best_score = score
-            best = bw
-    return best
-
-def _best_subwindow_by_edge(patch_rgb: np.ndarray, max_shift: int = 2) -> Image.Image:
-    H, W, _ = patch_rgb.shape
-    best_score = -1.0
-    best_crop = patch_rgb
-    for dy in (-max_shift, 0, max_shift):
-        for dx in (-max_shift, 0, max_shift):
-            y0 = max(0, dy if dy > 0 else 0)
-            x0 = max(0, dx if dx > 0 else 0)
-            y1 = min(H, H + (dy if dy < 0 else 0))
-            x1 = min(W, W + (dx if dx < 0 else 0))
-            crop = patch_rgb[y0:y1, x0:x1]
-            if crop.size == 0:
-                continue
-            g = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if cv2 is not None else np.array(Image.fromarray(crop).convert("L"))
-            score = _edge_energy(g)
-            if score > best_score:
-                best_score = score
-                best_crop = crop
-    if cv2 is not None:
-        resized = cv2.resize(best_crop, (W, H), interpolation=cv2.INTER_AREA)
-        return Image.fromarray(resized)
-    return Image.fromarray(best_crop).resize((W, H), resample=Image.Resampling.BICUBIC)
-
-# ---------- Binary selection + geometry cues ----------
-def _best_binary(gray: np.ndarray) -> np.ndarray:
-    variants: List[np.ndarray] = _prep_binary_variants_gray(gray)
-    if not variants:
-        pil = Image.fromarray(gray)
-        bw = np.array(_prep_gray_bw(pil, thresh=160, invert=False))
-        return bw
-    if cv2 is None:
-        scores = [v.std() for v in variants]
-        best = variants[int(np.argmax(scores))]
-        return best if best.mean() > 127 else (255 - best)
-    best_score = -1.0
-    best_bw = variants[0]
-    for v in variants:
-        bw = v if v.mean() > 127 else (255 - v)
-        gx = cv2.Sobel(bw, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(bw, cv2.CV_32F, 0, 1, ksize=3)
-        score = float((np.abs(gx) + np.abs(gy)).sum())
-        if score > best_score:
-            best_score = score
-            best_bw = bw
-    return best_bw
-
-def _detect_seven_confidence(pil_img: Image.Image) -> float:
-    if cv2 is None:
-        return 0.0
-    gray = np.array(pil_img.convert("L"))
-    bw = _best_binary(gray)
-    edges = cv2.Canny(bw, 50, 150, apertureSize=3)
-    h, w = edges.shape
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=15,
-                            minLineLength=max(6, w//5), maxLineGap=3)
-    if lines is None:
-        return 0.0
-    top_strength = 0.0
-    diag_strength = 0.0
-    for x1, y1, x2, y2 in lines.reshape(-1, 4):
-        dx, dy = x2 - x1, y2 - y1
-        length = max(1.0, float(np.hypot(dx, dy)))
-        slope = abs(dy) / length
-        angle = np.degrees(np.arctan2(abs(dy), abs(dx)))
-        if slope < 0.2 and min(y1, y2) < int(0.4 * h):
-            top_strength = max(top_strength, min(1.0, length / (w * 0.8)))
-        if 25 <= angle <= 70:
-            diag_strength = max(diag_strength, min(1.0, length / (w * 0.8)))
-    conf = 0.6 * top_strength + 0.4 * diag_strength
-    return float(max(0.0, min(1.0, conf)))
-
-def _detect_zero_confidence(pil_img: Image.Image) -> float:
-    if cv2 is None:
-        return 0.0
-    im = np.array(pil_img.convert("L"))
-    best_conf = 0.0
-    for inv in (False, True):
-        im2 = cv2.bitwise_not(im) if inv else im
-        _, bw = cv2.threshold(im2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        h, w = bw.shape[:2]
-        if h < 6 or w < 6:
-            continue
-        contours, hierarchy = cv2.findContours(bw, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        if hierarchy is None or len(contours) == 0:
-            continue
-        best_idx = None
-        best_area = 0.0
-        for i, cnt in enumerate(contours):
-            if hierarchy[0][i][3] != -1:
-                continue
-            area = cv2.contourArea(cnt)
-            if area > best_area:
-                best_area = area
-                best_idx = i
-        if best_idx is None or best_area < 10:
-            continue
-        has_child = any(hierarchy[0][j][3] == best_idx for j in range(len(contours)))
-        if not has_child:
-            continue
-        x, y, ww, hh = cv2.boundingRect(contours[best_idx])
-        aspect = ww / float(hh + 1e-6)
-        coverage = best_area / float(ww * hh + 1e-6)
-        asp_ok = max(0.0, 1.0 - abs(aspect - 1.1) / 0.8)
-        cov_ok = 1.0 - min(abs(coverage - 0.55) / 0.30, 1.0)
-        conf = 0.5 * asp_ok + 0.5 * cov_ok
-        best_conf = max(best_conf, conf)
-    return float(best_conf)
-
-def _zero_center_contrast_conf(pil_img: Image.Image) -> float:
-    gray = np.array(pil_img.convert("L"))
-    h, w = gray.shape
-    if h < 6 or w < 6:
-        return 0.0
-    g = _clahe(gray) if cv2 is not None else gray
-    if cv2 is not None:
-        edges = cv2.Canny(g, 50, 150)
-        ring_density = float((edges > 0).sum()) / float(max(1, h * w))
-    else:
-        ring_density = float(np.std(g)) / 255.0
-    cx0, cx1 = int(0.35 * w), int(0.65 * w)
-    cy0, cy1 = int(0.35 * h), int(0.65 * h)
-    center = g[cy0:cy1, cx0:cx1]
-    border_mask = np.ones_like(g, dtype=bool)
-    border_mask[cy0:cy1, cx0:cx1] = False
-    border = g[border_mask]
-    if center.size == 0 or border.size == 0:
-        return 0.0
-    delta = float(center.mean() - border.mean()) / 255.0
-    dens_score = min(1.0, ring_density / 0.25)
-    bright_score = max(0.0, min(1.0, (delta + 0.2) / 0.5))
-    return 0.6 * dens_score + 0.4 * bright_score
-
-def _count_connected_components(bw: np.ndarray) -> int:
-    if cv2 is None:
-        cols = (bw < 128).sum(axis=0) > 0
-        return int(max(1, np.diff(cols.astype(np.int32)).clip(min=0).sum()))
-    fg = (bw < 128).astype(np.uint8)
-    num_labels, _ = cv2.connectedComponents(fg)
-    return max(0, num_labels - 1)
-
-# ------------------------
-# Quarter OCR helpers
-# ------------------------
-def _sharpen(pil_img: Image.Image) -> Image.Image:
-    try:
-        return pil_img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
-    except Exception:
-        return pil_img
-
-def _score_quarter_candidate(raw: str) -> float:
-    if not raw:
-        return -1.0
-    s = raw.strip().upper()
-    s_nospace = re.sub(r"\s+", "", s)
-    score = 0.0
-    if "OT" in s_nospace or s_nospace == "0T": score += 4.0
-    if "Q" in s_nospace: score += 2.5
-    if re.search(r"\b(?:1ST|2ND|3RD|4TH)\b", s): score += 2.0
-    if re.search(r"\b[1-4]\b", s) or re.search(r"Q[ ]?[1-4]", s): score += 2.0
-    score -= 0.05 * len(s_nospace)
-    return score
-
-def _normalize_quarter(raw: str) -> Optional[str]:
-    if not raw:
-        return None
-    s = raw.strip().upper().replace(" ", "")
-    if s in {"Q1","Q2","Q3","Q4","OT"}:
-        return s
-    if s in {"1ST","2ND","3RD","4TH"}:
-        return {"1ST":"Q1","2ND":"Q2","3RD":"Q3","4TH":"Q4"}[s]
-    m = re.search(r"Q?([1-4])", s)
-    if m:
-        return f"Q{m.group(1)}"
-    if s in {"4T","4TH.","Q4.","Q-4"}: return "Q4"
-    if s in {"OT.","0T"}: return "OT"
-    return None
-
-def _ocr_quarter_ensemble(ocr: PaddleOCR, pil_img: Image.Image, viz_dir: Optional[Path] = None, tag: str = "q") -> str:
-    cands: List[Tuple[float, str]] = []
-    bases: List[Image.Image] = []
-    g = pil_img.convert("L")
-    for sc in (2, 3, 4):
-        bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
-    if cv2 is not None:
-        g_np = np.array(g)
-        bases.append(Image.fromarray(_clahe(g_np)))
-    bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
-
-    idx = 0
-    def add_candidate(img_like: Image.Image):
-        nonlocal idx
-        txt = _ocr_text(ocr, img_like if img_like.mode == "RGB" else img_like.convert("RGB"))
-        txt = (txt or "").strip()
-        if txt:
-            cands.append((_score_quarter_candidate(txt), txt))
-        if viz_dir:
-            try:
-                (viz_dir / f"quarter_ens_{tag}_{idx}.png").parent.mkdir(parents=True, exist_ok=True)
-                img_like.convert("RGB").save(viz_dir / f"quarter_ens_{tag}_{idx}.png")
-            except Exception:
-                pass
-        idx += 1
-
-    for b in bases:
-        add_candidate(b)
-        for thr in (130, 160, 190):
-            bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
-            add_candidate(bw)
-            add_candidate(ImageOps.invert(bw))
-        gray = np.array(b if b.mode == "L" else b.convert("L"))
-        pol = _choose_polarity(gray)
-        pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
-        add_candidate(pol_rgb)
-
-    if not cands:
-        return ""
-    cands.sort(key=lambda t: t[0], reverse=True)
-    return cands[0][1]
-
-# ---------- Down/Distance & Yardline OCR ensembles ----------
-def _score_down_dist_candidate(raw: str) -> float:
-    if not raw:
-        return -1.0
-    s = raw.strip().upper()
-    s = re.sub(r"[^A-Z0-9& ]", "", s)
-    score = 0.0
-    if re.search(r"\b(1ST|2ND|3RD|4TH|[1-4])\b", s): score += 3.0
-    if "&" in s or " AND " in f" {s} ": score += 2.0
-    if "GOAL" in s: score += 1.5
-    if re.search(r"\b\d{1,2}\b", s): score += 1.0
-    score -= 0.03 * len(s.replace(" ", ""))
-    return score
-
-def _ocr_down_dist_ensemble(ocr: PaddleOCR, pil_img: Image.Image,
-                            viz_dir: Optional[Path] = None, tag: str = "dd") -> str:
-    cands: List[Tuple[float, str]] = []
-    g = pil_img.convert("L")
-    bases: List[Image.Image] = []
-    for sc in (2, 3, 4):
-        bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
-    if cv2 is not None:
-        bases.append(Image.fromarray(_clahe(np.array(g))))
-    bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
-
-    idx = 0
-    def add(txt_img: Image.Image):
-        nonlocal idx
-        t = _ocr_text(ocr, txt_img if txt_img.mode == "RGB" else txt_img.convert("RGB"))
-        t = (t or "").strip()
-        if t:
-            cands.append((_score_down_dist_candidate(t), t))
-        if viz_dir:
-            try:
-                out = viz_dir / f"dd_ens_{tag}_{idx}.png"
-                out.parent.mkdir(parents=True, exist_ok=True)
-                txt_img.convert("RGB").save(out)
-            except Exception: pass
-        idx += 1
-
-    for b in bases:
-        add(b)
-        for thr in (130, 160, 190, 205):
-            bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
-            add(bw); add(ImageOps.invert(bw))
-        gray = np.array(b if b.mode == "L" else b.convert("L"))
-        pol = _choose_polarity(gray)
-        pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
-        add(pol_rgb)
-
-    if not cands:
-        return ""
-    cands.sort(key=lambda x: x[0], reverse=True)
-    return cands[0][1]
-
-def _score_yardline_candidate(raw: str) -> float:
-    if not raw:
-        return -1.0
-    s = raw.strip().upper()
-    s = re.sub(r"[^A-Z0-9 ]", "", s)
-    score = 0.0
-    m = re.search(r"\b(50|[0-4]?\d)\b", s)
-    if m:
-        score += 3.0
-        val = int(m.group(1))
-        if 10 <= val <= 40: score += 0.5
-    if re.search(r"\b[A-Z]{2,4}\b", s):
-        score += 1.5
-    score -= 0.03 * len(s.replace(" ", ""))
-    return score
-
-def _ocr_yardline_ensemble(ocr: PaddleOCR, pil_img: Image.Image,
-                           viz_dir: Optional[Path] = None, tag: str = "yl") -> str:
-    cands: List[Tuple[float, str]] = []
-    g = pil_img.convert("L")
-    bases: List[Image.Image] = []
-    for sc in (2, 3, 4):
-        bases.append(g.resize((max(1, g.width * sc), max(1, g.height * sc))))
-    if cv2 is not None:
-        bases.append(Image.fromarray(_clahe(np.array(g))))
-    bases = [_sharpen(Image.fromarray(np.array(b))) for b in bases]
-
-    idx = 0
-    def add(txt_img: Image.Image):
-        nonlocal idx
-        t = _ocr_text(ocr, txt_img if txt_img.mode == "RGB" else txt_img.convert("RGB"))
-        t = (t or "").strip()
-        if t:
-            cands.append((_score_yardline_candidate(t), t))
-        if viz_dir:
-            try:
-                out = viz_dir / f"yl_ens_{tag}_{idx}.png"
-                out.parent.mkdir(parents=True, exist_ok=True)
-                txt_img.convert("RGB").save(out)
-            except Exception: pass
-        idx += 1
-
-    for b in bases:
-        add(b)
-        for thr in (130, 160, 190, 205):
-            bw = _prep_gray_bw(b.convert("RGB"), thresh=thr, invert=False)
-            add(bw); add(ImageOps.invert(bw))
-        gray = np.array(b if b.mode == "L" else b.convert("L"))
-        pol = _choose_polarity(gray)
-        pol_rgb = Image.fromarray(cv2.cvtColor(pol, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([pol]*3, -1))
-        add(pol_rgb)
-
-    if not cands:
-        return ""
-    cands.sort(key=lambda x: x[0], reverse=True)
-    return cands[0][1]
-
-# ------------------------
-# Normalization + voting (common)
-# ------------------------
 _CLOCK_RX = re.compile(r"^\s*(\d{1,2}):([0-5]\d)\s*$", re.I)
-_DOWN_DIST_RX = re.compile(r"\b(1ST|2ND|3RD|4TH|\d)\s*(?:&|AND)\s*(GOAL|\d{1,2})\b", re.I)
-_YARDLINE_RX = re.compile(r"\b([A-Z]{2,4})?\s*(50|[0-4]?\d)\b", re.I)
+_DOWN_DIST_RX = re.compile(
+    r"\b(1ST|2ND|3RD|4TH|\d)\s*(?:&|AND)\s*(GOAL|\d{1,2})\b",
+    re.I,
+)
+_YARDLINE_RX = re.compile(
+    r"\b([A-Z]{2,4})?\s*(50|[0-4]?\d)\b",
+    re.I,
+)
+
+_QUARTER_TOKENS = ["1ST", "2ND", "3RD", "4TH", "Q1", "Q2", "Q3", "Q4", "OT"]
+
 
 def _norm_team(s: str) -> Optional[str]:
     s = (s or "").strip()
     if not s:
         return None
-    return re.sub(r"[^A-Z]", "", s.upper()) or None
+    out = re.sub(r"[^A-Z]", "", s.upper())
+    return out or None
 
-def _digits2(s: str) -> Optional[int]:
-    m = re.search(r"\d{1,2}", (s or ""))
-    return int(m.group(0)) if m else None
 
 def _norm_clock(s: str) -> Optional[str]:
     if not s:
@@ -945,38 +690,249 @@ def _norm_clock(s: str) -> Optional[str]:
         return f"{int(m.group(1))}:{m.group(2)}"
     return None
 
+def _norm_clock_flexible(s: str) -> Optional[str]:
+    """
+    More flexible normalization for OCR'd clocks:
+    - Enforces football constraints: minutes 0–15, seconds 0–59.
+    - Handles:
+      * '5:38'  -> '5:38'
+      * '5338'  -> '5:38'
+      * '248'   -> '2:48'
+      * '40'    -> '0:40'
+    """
+    if not s:
+        return None
+
+    # Clean & normalize
+    s = (
+        s.strip()
+         .replace(" ", "")
+         .replace(";", ":")
+         .replace(".", ":")
+         .replace("O", "0")
+         .replace("o", "0")
+    )
+
+    # If it already has a colon, treat it as MM:SS
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+    if m:
+        mins = int(m.group(1))
+        secs = int(m.group(2))
+        if 0 <= mins <= 15 and 0 <= secs <= 59:
+            return f"{mins}:{secs:02d}"
+        return None
+
+    # From here on, only digits
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return None
+
+    # 3 digits → M:SS (e.g. '248' -> 2:48)
+    if len(digits) == 3:
+        mins = int(digits[0])
+        secs = int(digits[1:])
+        if 0 <= mins <= 15 and 0 <= secs <= 59:
+            return f"{mins}:{secs:02d}"
+
+    # 4 digits:
+    #  First try MM:SS (e.g. '1234' -> 12:34, but reject 53:38).
+    #  If that fails, try M:SS using the first digit as minutes and last two as seconds (e.g. '5338' -> 5:38).
+    if len(digits) == 4:
+        mins2 = int(digits[:2])
+        secs2 = int(digits[2:])
+        if 0 <= mins2 <= 15 and 0 <= secs2 <= 59:
+            return f"{mins2}:{secs2:02d}"
+
+        mins1 = int(digits[0])
+        secs1 = int(digits[2:])
+        if 0 <= mins1 <= 15 and 0 <= secs1 <= 59:
+            return f"{mins1}:{secs1:02d}"
+
+    # 2 digits → assume :SS, but cap to normal seconds
+    if len(digits) == 2:
+        secs = int(digits)
+        if 0 <= secs <= 59:
+            return f"0:{secs:02d}"
+
+    return None
+
+def _score_quarter_candidate(raw: str) -> float:
+    if not raw:
+        return -1.0
+    s = raw.strip().upper()
+    s_nospace = re.sub(r"\s+", "", s)
+    score = 0.0
+    if "OT" in s_nospace or s_nospace == "0T":
+        score += 4.0
+    if "Q" in s_nospace:
+        score += 2.5
+    if re.search(r"\b(?:1ST|2ND|3RD|4TH)\b", s):
+        score += 2.0
+    if re.search(r"\b[1-4]\b", s) or re.search(r"Q[ ]?[1-4]", s):
+        score += 2.0
+    score -= 0.05 * len(s_nospace)
+    return score
+
+
+def _normalize_quarter(raw: str) -> Optional[str]:
+    """
+    Make quarter detection more robust to EasyOCR quirks:
+    ZND -> 2ND, Ath -> 4TH, etc. Uses fuzzy matching as a fallback.
+    """
+    if not raw:
+        return None
+
+    s = raw.strip().upper()
+    s = s.replace("%", "").replace("?", "")
+
+    # First, try the old direct logic
+    s_no_space = s.replace(" ", "")
+    if s_no_space in {"Q1", "Q2", "Q3", "Q4", "OT"}:
+        return s_no_space
+    if s_no_space in {"1ST", "2ND", "3RD", "4TH"}:
+        return {"1ST": "Q1", "2ND": "Q2", "3RD": "Q3", "4TH": "Q4"}[s_no_space]
+
+    m = re.search(r"Q?([1-4])", s_no_space)
+    if m:
+        return f"Q{m.group(1)}"
+    if s_no_space in {"4T", "4TH.", "Q4.", "Q-4"}:
+        return "Q4"
+    if s_no_space in {"OT.", "0T"}:
+        return "OT"
+
+    # Heuristic fixes for very common OCR mistakes
+    if s_no_space in {"ZND", "2NO"}:
+        return "Q2"
+    if s_no_space in {"ATH", "4H", "A7H"}:
+        return "Q4"
+
+    # Fuzzy match against quarter tokens
+    best_token = None
+    best_score = 0
+    for tok in _QUARTER_TOKENS:
+        score = fuzz.ratio(s_no_space, tok)
+        if score > best_score:
+            best_score = score
+            best_token = tok
+
+    # Require some minimum confidence
+    if best_token and best_score >= 60:
+        if best_token in {"Q1", "Q2", "Q3", "Q4", "OT"}:
+            return best_token
+        if best_token in {"1ST", "2ND", "3RD", "4TH"}:
+            return {"1ST": "Q1", "2ND": "Q2", "3RD": "Q3", "4TH": "Q4"}[best_token]
+
+    return None
+
+
 def _parse_down_distance(s: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
     if not s:
-        return (None, None, None)
+        return None, None, None
+
+    # Clean up to alphanumerics, &, and space
     t = re.sub(r"[^A-Za-z0-9& ]", "", s.upper()).strip()
+
+    # Fix common EasyOCR confusions for down text before parsing.
+    replacements = {
+        "15T": "1ST",
+        "75T": "1ST",
+        "IST": "1ST",
+        "ZND": "2ND",
+        "ZUD": "2ND",
+        "2ST": "2ND",
+    }
+    for bad, good in replacements.items():
+        if bad in t:
+            t = t.replace(bad, good)
+
+    down_map = {"1ST": 1, "2ND": 2, "3RD": 3, "4TH": 4}
+
+    # --- SPECIAL CASE: INCHES (3RD & INCHES, etc.) ---
+    # We often see only the tail of "INCHES" in the distance ROI: CHES, HES, NCHES...
+    if any(k in t for k in ("INCH", "NCHES", "CHES", "HES")):
+        # We always build s as "down_raw & dist_raw", so split on '&'
+        left, _, right = t.partition("&")
+        left = left.strip()
+
+        # Parse down from the left part (e.g., "3RDGL" -> "3RD")
+        down = None
+        m_down = re.search(r"(1ST|2ND|3RD|4TH|[1-4])", left)
+        if m_down:
+            token = m_down.group(1)
+            if token in down_map:
+                down = down_map[token]
+            elif token.isdigit():
+                down = int(token)
+
+        # Represent inches as distance = 1, distance_text = "INCHES"
+        return down, 1, "INCHES"
+
+    # --- Normal "X & Y" / "X & GOAL" handling ---
     m = _DOWN_DIST_RX.search(t)
     if not m:
+        # Fallback: numeric down & distance ("2 & 9", etc.)
         m2 = re.search(r"\b([1234])\s*(?:&|AND)\s*(GOAL|\d{1,2})\b", t)
         if not m2:
-            return (None, None, None)
+            return None, None, None
         g1, g2 = m2.group(1), m2.group(2)
         down = int(g1)
         if g2 == "GOAL":
-            return (down, None, "GOAL")
-        return (down, int(g2), g2)
+            return down, None, "GOAL"
+        return down, int(g2), g2
+
     g1, g2 = m.group(1), m.group(2)
-    down_map = {"1ST":1,"2ND":2,"3RD":3,"4TH":4}
     down = down_map.get(g1, None) if not g1.isdigit() else int(g1)
     if g2 == "GOAL":
-        return (down, None, "GOAL")
-    return (down, int(g2), g2)
+        return down, None, "GOAL"
+    return down, int(g2), g2
 
 def _parse_yardline(s: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Parse yardline strings, handling ugly OCR like '439' (→ 39).
+    """
     if not s:
-        return (None, None)
+        return None, None
+
     t = re.sub(r"[^A-Za-z0-9 ]", "", s.upper()).strip()
+
+    # --- Fix common OCR confusions ---
+    # 7 ↔ 1, 5 ↔ S, 0 ↔ O
+    t = (
+        t.replace("75T", "1ST")
+         .replace("7ST", "1ST")
+         .replace("SND", "2ND")
+         .replace("5ND", "2ND")
+         .replace("3RO", "3RD")
+         .replace("30D", "3RD")
+         .replace("40H", "4TH")
+         .replace("A7H", "4TH")
+    )
+
+    # First try the classic pattern (TEAM 39, CHI 39, etc.)
     m = _YARDLINE_RX.search(t)
-    if not m:
-        return (None, None)
-    side = (m.group(1) or "").strip() or None
-    y = int(m.group(2))
-    y = max(0, min(50, y))
-    return (side, y)
+    if m:
+        side = (m.group(1) or "").strip() or None
+        y = int(m.group(2))
+        y = max(0, min(50, y))
+        return side, y
+
+    # Fallback: search all 1–2 digit chunks and pick the last
+    nums = re.findall(r"\d{1,2}", t)
+    if nums:
+        for candidate in reversed(nums):
+            val = int(candidate)
+            if 0 <= val <= 50:
+                return None, val
+
+    # Absolute last chance: handle weird 3-digit combos like '439'
+    digits = re.sub(r"\D", "", t)
+    if len(digits) == 3:
+        last_two = int(digits[1:])
+        if 0 <= last_two <= 50:
+            return None, last_two
+
+    return None, None
+
 
 def _mode_str(values: List[Optional[str]]) -> Optional[str]:
     vals = [v for v in values if v]
@@ -985,12 +941,14 @@ def _mode_str(values: List[Optional[str]]) -> Optional[str]:
     from collections import Counter
     return Counter(vals).most_common(1)[0][0]
 
+
 def _mode_int(values: List[Optional[int]]) -> Optional[int]:
     nums = [v for v in values if isinstance(v, int)]
     if not nums:
         return None
     from collections import Counter
     return Counter(nums).most_common(1)[0][0]
+
 
 def _compose_legacy_score(
     a_text: Optional[str],
@@ -1006,60 +964,66 @@ def _compose_legacy_score(
         return f"{int(at)}-{int(ht)}"
     return None
 
-# ------------------------
-# Preset detection (top-right)
-# ------------------------
-def _detect_preset_from_topright(frame_png: Path, ocr: PaddleOCR, viz_dir: Optional[Path]) -> Optional[str]:
-    with Image.open(frame_png) as im:
-        w, h = im.size
-        lx, ty, rx, by = _scale_box_to_frame(TOPRIGHT_BOX_REF, w, h)
-        crop = _crop_rect_safe(im, lx, ty, rx, by)
 
-    if viz_dir:
-        try:
-            (viz_dir / "topright_raw.png").parent.mkdir(parents=True, exist_ok=True)
-            crop.save(viz_dir / "topright_raw.png")
-        except Exception:
-            pass
+# ---------------------------------------------------------------------------
+# Main public API – EasyOCR + skin auto-detect
+# ---------------------------------------------------------------------------
 
-    letters = _ocr_letters_strict(ocr, crop, viz_dir=viz_dir, stamp="TR")
-    if not letters:
+def _ocr_score_int(patch: Optional[Image.Image]) -> Optional[int]:
+    """
+    Specialized OCR for scoreboard *scores* (not downs/distances).
+
+    Uses the generic digit OCR, then applies a football-specific
+    sanity check to fix common 7→1 misreads.
+    """
+    if patch is None:
         return None
 
-    up = letters.upper()
-    if "SNP" in up: return "SNP"
-    if "TNP" in up: return "TNP"
-    if "MNP" in up: return "MNP"
-    if "S" in up: return "SNP"
-    if "T" in up: return "TNP"
-    if "M" in up: return "MNP"
-    return None
+    val = _ocr_digits_int(patch)
+    if val is None:
+        return None
 
-# ------------------------
-# Public API
-# ------------------------
+    # Domain heuristic:
+    # A raw score of exactly 1 is almost certainly a misread 7.
+    # (You basically never see a team sitting at 1 point.)
+    if val == 1:
+        return 7
+
+    return val
+
 def extract_scoreboard_from_video_paddle(
     video_path: str,
     *,
     t: float = 0.10,
-    attempts: int = 3,
+    attempts: int = 1,
     viz: bool = False,
     profile_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Canonical crop → resize → pixel-ROI → OCR:
-      * Robust score reading (with targeted TNP-away rescue).
-      * Quarter: specialized ensemble and normalization; larger ROI padding.
-      * Down/Distance & Yardline: ensemble OCR + parse + mode voting.
-    """
-    run_id = f"ocr_{uuid.uuid4().hex[:8]}"
+    t_start = time.perf_counter()
+    log.info(
+        "=== [extract_scoreboard] Starting on %s (EasyOCR, attempts=%d, viz=%s, profile=%s) ===",
+        video_path,
+        attempts,
+        viz,
+        profile_key,
+    )
+
+    run_id = f"easyocr_{uuid.uuid4().hex[:8]}"
     run_dir = Path("data/tmp/ocr") / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    ts_list: List[float] = [max(0.0, t + 0.10 * k) for k in range(max(1, attempts))]
-    ocr = _ocr_init()
+    if viz:
+        (run_dir / "scorebar").mkdir(exist_ok=True)
+        (run_dir / "rois").mkdir(exist_ok=True)
+        (run_dir / "meta").mkdir(exist_ok=True)
 
-    chosen_preset: str = "DEFAULT"
+    ts_list: List[float] = [max(0.0, t + 0.10 * k) for k in range(max(1, attempts))]
+
+    # Initial preset (from profile_key if given; otherwise DEFAULT)
+    chosen_preset = (profile_key or "DEFAULT").upper()
+    if chosen_preset not in SCOREBAR_BOX_PRESETS:
+        log.warning("Unknown profile_key=%s, will auto-detect from frame", profile_key)
+        chosen_preset = "DEFAULT"
 
     away_team_reads: List[Optional[str]] = []
     home_team_reads: List[Optional[str]] = []
@@ -1070,255 +1034,169 @@ def extract_scoreboard_from_video_paddle(
     clock_reads: List[Optional[str]] = []
     quarter_raw_reads: List[Optional[str]] = []
     quarter_norm_reads: List[Optional[str]] = []
-    # NEW: down/distance + yardline + optional gameclock
     down_reads: List[Optional[int]] = []
     distance_reads: List[Optional[int]] = []
     distance_text_reads: List[Optional[str]] = []
     yard_side_reads: List[Optional[str]] = []
     yardline_reads: List[Optional[int]] = []
-    game_clock_reads: List[Optional[str]] = []
 
-    # --- Rescue helper (TNP-away only) ---
-    def _rescue_read_digits_for_tnp_away(patch_np: np.ndarray) -> Tuple[Optional[str], Optional[int], bool]:
-        gray = np.array(Image.fromarray(patch_np).convert("L"))
-        norm = _illumination_normalize(gray)
-        norm = _clahe(norm)
-        best_bw = _choose_polarity(norm)
-
-        extra_imgs: List[Image.Image] = []
-        extra_imgs.append(Image.fromarray(cv2.cvtColor(norm, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([norm]*3, -1)))
-        extra_imgs.append(Image.fromarray(cv2.cvtColor(best_bw, cv2.COLOR_GRAY2RGB) if cv2 is not None else np.stack([best_bw]*3, -1)))
-        nudged = _best_subwindow_by_edge(patch_np, max_shift=2)
-        extra_imgs.append(nudged)
-        big = Image.fromarray(patch_np).resize(
-            (patch_np.shape[1]*5, patch_np.shape[0]*5),
-            resample=Image.Resampling.BICUBIC
-        )
-        extra_imgs.append(big)
-
-        dg = _ocr_digits_ensemble(ocr, Image.fromarray(patch_np), viz_dir=(run_dir if viz else None), tag="tnp_away_rescue", extra_images=extra_imgs)
-        dg = (dg or "").strip()
-
-        tpl = _template_match_digits_with_conf(Image.fromarray(patch_np), "TNP", max_digits=2)
-        tpl_guess, tpl_conf = (tpl[0], tpl[1]) if tpl else (None, 0.0)
-
-        z_conf  = _detect_zero_confidence(Image.fromarray(patch_np))
-        zc2     = _zero_center_contrast_conf(Image.fromarray(patch_np))
-        zero_hint = (z_conf >= 0.58) or ((z_conf >= 0.52) and (zc2 >= 0.58))
-
-        if not dg:
-            if tpl_guess == "0" and tpl_conf >= 0.46 and zero_hint:
-                dg = "0"
-        if not dg and zero_hint:
-            return None, 0, True
-
-        return (dg or None, (int(dg) if dg and dg.isdigit() else None), zero_hint)
+    auto_profile = None
 
     for i, ts in enumerate(ts_list):
+        log.info(
+            "=== [extract_scoreboard] Frame %d @ t=%.2fs (preset=%s) ===",
+            i + 1,
+            ts,
+            chosen_preset,
+        )
         frame_png = run_dir / f"frame_t{ts:.2f}.png"
         _grab_frame(video_path, ts, frame_png)
 
-        if i == 0:
-            if profile_key and profile_key.upper() in ROI_PRESETS_CANON:
-                chosen_preset = profile_key.upper()
-            else:
-                detected = _detect_preset_from_topright(frame_png, ocr, viz_dir=(run_dir if viz else None))
-                chosen_preset = detected if (detected and detected in ROI_PRESETS_CANON) else "DEFAULT"
-
-        if viz and i == 0:
-            full_box = SCOREBAR_BOX_PRESETS.get(chosen_preset, SCOREBAR_BOX_DEFAULT)
-            _draw_frame_scorebar_outline(frame_png, full_box, run_dir / f"frame_with_scorebar_t{ts:.2f}.png")
-
         with Image.open(frame_png) as full_pil:
+            # Auto-detect skin once from first frame if profile_key not supplied
+            if profile_key is None and i == 0:
+                auto_profile = _detect_profile_from_topright(
+                    full_pil,
+                    viz_dir=(run_dir / "meta") if viz else None,
+                )
+                if auto_profile != chosen_preset:
+                    log.info(
+                        "[extract_scoreboard] Auto-detected skin %s (was %s)",
+                        auto_profile,
+                        chosen_preset,
+                    )
+                    chosen_preset = auto_profile
+
             sb_crop_np = crop_scorebar(full_pil, chosen_preset)
+
         sb_canon = to_canonical(sb_crop_np, chosen_preset)
+        patches = extract_rois(sb_canon, chosen_preset, pad=2)
 
         if viz:
-            Image.fromarray(sb_canon).save(run_dir / f"scorebar_canonical_{chosen_preset}_t{ts:.2f}.png")
-            draw_roi_overlay(sb_canon, chosen_preset, str(run_dir / f"scorebar_overlay_{chosen_preset}_t{ts:.2f}.png"))
+            Image.fromarray(sb_canon).save(
+                run_dir / "scorebar" / f"{chosen_preset}_scorebar_t{ts:.2f}.png"
+            )
+            debug_img = _draw_roi_debug(sb_canon, chosen_preset)
+            debug_img.save(
+                run_dir
+                / "scorebar"
+                / f"{chosen_preset}_scorebar_debug_t{ts:.2f}.png"
+            )
+            for name, arr in patches.items():
+                Image.fromarray(arr).save(
+                    run_dir / "rois" / f"{i:02d}_{chosen_preset}_{name}.png"
+                )
 
-        # quarter gets a bit more padding; also pad new fields a touch
-        patches = extract_rois(
-            sb_canon,
-            chosen_preset,
-            pad=2,
-            roi_pad_overrides={"quarter": 4, "down_dist": 3, "yardline": 3, "gameclock": 3}
+        def get_patch(name: str) -> Optional[Image.Image]:
+            arr = patches.get(name)
+            if arr is None:
+                return None
+            return Image.fromarray(arr)
+
+        # Teams
+        a_team = (
+            _norm_team(_ocr_team(get_patch("away_team")) or "")
+            if get_patch("away_team")
+            else None
+        )
+        h_team = (
+            _norm_team(_ocr_team(get_patch("home_team")) or "")
+            if get_patch("home_team")
+            else None
         )
 
-        def ocr_roi(name: str) -> str:
-            patch = patches.get(name)
-            if patch is None:
-                return ""
-            pil_patch = Image.fromarray(patch)
-            patch_bw = _prep_gray_bw(pil_patch, thresh=160, invert=False)
-            return _ocr_text(ocr, patch_bw)
+        # Scores
+                # Scores (use score-specific OCR to fix 7→1 misreads)
+        a_sc_int = _ocr_score_int(get_patch("away_score"))
+        h_sc_int = _ocr_score_int(get_patch("home_score"))
 
-        a_team_raw = ocr_roi("away_team")
-        h_team_raw = ocr_roi("home_team")
+        a_sc_text = str(a_sc_int) if a_sc_int is not None else None
+        h_sc_text = str(h_sc_int) if h_sc_int is not None else None
 
-        a_sc_patch = patches.get("away_score")
-        h_sc_patch = patches.get("home_score")
+        # Clock: prefer main 'clock' ROI, then fall back to 'gameclock'
+        clk = _ocr_clock(get_patch("clock")) if get_patch("clock") else None
+        if not clk and get_patch("gameclock"):
+            clk = _ocr_clock(get_patch("gameclock"))
 
-        # -------- primary score reader --------
-        def read_score_patch(patch_np: Optional[np.ndarray], tag: str) -> Tuple[Optional[str], Optional[int]]:
-            if patch_np is None:
-                return None, None
-            pil_patch = Image.fromarray(patch_np)
+        # Quarter
+        q_raw = None
+        q_norm = None
+        if get_patch("quarter"):
+            q_txt_raw = _ocr_generic_text(get_patch("quarter"))
+            q_txt_clean = q_txt_raw.strip().upper()
 
-            dg = _ocr_digits_ensemble(ocr, pil_patch, viz_dir=(run_dir if viz else None), tag=tag)
-            dg = (dg or "").strip()
-
-            z_conf  = _detect_zero_confidence(pil_patch)
-            zc2     = _zero_center_contrast_conf(pil_patch)
-            s_conf  = _detect_seven_confidence(pil_patch)
-            tpl     = _template_match_digits_with_conf(pil_patch, chosen_preset, max_digits=2)
-            tpl_guess, tpl_conf = (tpl[0], tpl[1]) if tpl else (None, 0.0)
-
-            gray = np.array(pil_patch.convert("L"))
-            bwv  = _prep_binary_variants_gray(gray)
-            H, W = gray.shape
-            aspect = W / float(H + 1e-6)
-
-            ratios = []
-            for bw in bwv:
-                cols = (bw < 128).sum(axis=0)
-                ratios.append(cols.mean() / max(1, bw.shape[1]))
-            fg_ratio = float(np.median(ratios)) if ratios else 0.0
-
-            cc_counts = []
-            for bw in bwv:
-                cc_counts.append(_count_connected_components(bw if bw.mean() > 127 else (255 - bw)))
-            cc = int(np.median(cc_counts)) if cc_counts else 1
-
-            is_SNP = (chosen_preset == "SNP")
-            SEVEN_STRONG = 0.58 if is_SNP else 0.65
-            SEVEN_TPL    = 0.38 if is_SNP else 0.40
-            ZERO_STRONG  = 0.70 if is_SNP else 0.72
-            ZERO_PAIR    = 0.58 if is_SNP else 0.60
-            ZERO_TPL     = 0.52 if is_SNP else 0.55
-            TPL_2DIG     = 0.48 if is_SNP else 0.50
-
-            strong_zero = (z_conf >= ZERO_STRONG) or ((z_conf >= ZERO_PAIR) and (zc2 >= ZERO_PAIR))
-            tpl_zero_ok = (tpl_guess == "0" and tpl_conf >= ZERO_TPL)
-
-            if not dg:
-                if strong_zero or tpl_zero_ok:
-                    dg = "0"
-            elif len(dg) == 1 and dg != "0":
-                if strong_zero:
-                    dg = "0"
-
-            if (not dg) or (dg == "1"):
-                if s_conf >= SEVEN_STRONG:
-                    dg = "7"
-                elif tpl_guess == "7" and tpl_conf >= SEVEN_TPL:
-                    dg = "7"
-                else:
-                    if fg_ratio >= 0.33 and tpl_guess:
-                        dg = tpl_guess
-
-            if (not dg) or (len(dg) == 1):
-                if tpl_guess and len(tpl_guess) == 2 and tpl_conf >= TPL_2DIG:
-                    if (aspect >= 0.90) or (cc >= 2):
-                        dg = tpl_guess
-
-            if dg and len(dg) > 2:
-                dg = dg[-2:]
-
-            return (dg or None, (int(dg) if dg and dg.isdigit() else None))
-
-        a_sc_text, a_sc_int = read_score_patch(a_sc_patch, "away")
-        h_sc_text, h_sc_int = read_score_patch(h_sc_patch, "home")
-
-        if chosen_preset == "TNP" and (a_sc_text is None or a_sc_text == "") and a_sc_patch is not None:
-            r_text, r_int, r_zero_hint = _rescue_read_digits_for_tnp_away(a_sc_patch)
-            if r_text is not None or r_int is not None:
-                a_sc_text = r_text if r_text is not None else a_sc_text
-                a_sc_int = r_int if r_int is not None else a_sc_int
-            elif r_zero_hint and a_sc_int is None:
-                a_sc_int = 0
-
-        # -------- quarter (specialized ensemble + normalization) --------
-        q_patch = patches.get("quarter")
-        q_raw_best: Optional[str] = None
-        q_norm_best: Optional[str] = None
-        if q_patch is not None:
-            q_pil = Image.fromarray(q_patch)
-            q_raw_candidate = _ocr_quarter_ensemble(ocr, q_pil, viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}")
-            q_raw_simple = _ocr_text(ocr, _prep_gray_bw(q_pil, 160, False))
-            cand_list = [(q_raw_candidate or ""), (q_raw_simple or "")]
-            cand_scored = sorted((( _score_quarter_candidate(c), c) for c in cand_list if c), reverse=True)
-            if cand_scored:
-                q_raw_best = cand_scored[0][1]
-                q_norm_best = _normalize_quarter(q_raw_best)
-
-        # clock(s)
-        c_raw = ocr_roi("clock")
-        gc_raw = ocr_roi("gameclock")
-        clk_norm = _norm_clock(gc_raw) or _norm_clock(c_raw)
-
-        # NEW: down & distance + yardline via ensembles
-        dd_raw = ""
-        if patches.get("down_dist") is not None:
-            dd_raw = _ocr_down_dist_ensemble(
-                ocr, Image.fromarray(patches["down_dist"]),
-                viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}"
-            )
-        yl_raw = ""
-        if patches.get("yardline") is not None:
-            yl_raw = _ocr_yardline_ensemble(
-                ocr, Image.fromarray(patches["yardline"]),
-                viz_dir=(run_dir if viz else None), tag=f"t{ts:.2f}"
+            # Fix common EasyOCR confusions: Z↔2, A↔4, S↔5, etc.
+            q_txt_fixed = (
+                q_txt_clean
+                .replace("Z", "2")
+                .replace("A", "4")
+                .replace("@", "4")
+                .replace("5T", "ST")  # '5T' -> 'ST' in '1ST', '2ND' usually fine
             )
 
-        # collect per-frame reads
-        away_team_reads.append(_norm_team(a_team_raw))
-        home_team_reads.append(_norm_team(h_team_raw))
+            if q_txt_fixed:
+                q_raw = q_txt_fixed
+                q_norm = _normalize_quarter(q_txt_fixed)
+
+        # Down & distance – read separate ROIs, then combine for parsing
+        down_raw = _ocr_generic_text(get_patch("down")) if get_patch("down") else ""
+        dist_raw = _ocr_generic_text(get_patch("distance")) if get_patch("distance") else ""
+
+        if down_raw or dist_raw:
+            dd_raw = f"{down_raw} & {dist_raw}".strip(" &")
+        else:
+            dd_raw = ""
+
+        log.debug(
+            "[down/distance][easyocr] raw_down='%s' raw_dist='%s' combined='%s'",
+            down_raw,
+            dist_raw,
+            dd_raw,
+        )
+
+        dwn, dist, dist_txt = _parse_down_distance(dd_raw) if dd_raw else (None, None, None)
+
+        # Yardline
+        yl_raw = (
+            _ocr_generic_text(get_patch("yardline")) if get_patch("yardline") else ""
+        )
+        y_side, y_line = _parse_yardline(yl_raw) if yl_raw else (None, None)
+
+        # Collect across frames
+        away_team_reads.append(a_team)
+        home_team_reads.append(h_team)
         away_score_text_reads.append(a_sc_text)
         home_score_text_reads.append(h_sc_text)
         away_score_int_reads.append(a_sc_int)
         home_score_int_reads.append(h_sc_int)
-        clock_reads.append(clk_norm)
-        game_clock_reads.append(_norm_clock(gc_raw) if gc_raw else None)
-        quarter_raw_reads.append((q_raw_best or "").strip() or None)
-        quarter_norm_reads.append(q_norm_best)
+        clock_reads.append(clk)
+        quarter_raw_reads.append(q_raw)
+        quarter_norm_reads.append(q_norm)
+        down_reads.append(dwn)
+        distance_reads.append(dist)
+        distance_text_reads.append(
+            dist_txt or (str(dist) if dist is not None else None)
+        )
+        yard_side_reads.append(y_side)
+        yardline_reads.append(y_line)
 
-        # parse and store down/distance
-        if dd_raw:
-            dwn, dist, dist_txt = _parse_down_distance(dd_raw)
-            down_reads.append(dwn)
-            distance_reads.append(dist)
-            distance_text_reads.append(dist_txt or (str(dist) if dist is not None else None))
-        else:
-            down_reads.append(None); distance_reads.append(None); distance_text_reads.append(None)
+    log.info(
+        "=== [extract_scoreboard] Finished EasyOCR in %.2f seconds ===",
+        time.perf_counter() - t_start,
+    )
 
-        # parse and store yardline
-        if yl_raw:
-            yside, yline = _parse_yardline(yl_raw)
-            yard_side_reads.append(yside)
-            yardline_reads.append(yline)
-        else:
-            yard_side_reads.append(None); yardline_reads.append(None)
-
-        if viz and q_patch is not None and q_raw_best:
-            try:
-                Image.fromarray(q_patch).save(run_dir / f"quarter_patch_t{ts:.2f}.png")
-            except Exception:
-                pass
-
-    # Aggregate across frames
+    # Aggregate
     away_team = _mode_str(away_team_reads)
     home_team = _mode_str(home_team_reads)
     away_score_text = _mode_str(away_score_text_reads)
     home_score_text = _mode_str(home_score_text_reads)
     away_score_best = _mode_int(away_score_int_reads)
     home_score_best = _mode_int(home_score_int_reads)
-    clk = _mode_str(clock_reads)
+    clk_best = _mode_str(clock_reads)
 
     quarter_text = _mode_str(quarter_raw_reads)
     quarter = _mode_str(quarter_norm_reads)
 
-    # NEW aggregates
     down_best = _mode_int(down_reads)
     distance_best = _mode_int(distance_reads)
     distance_text_best = _mode_str(distance_text_reads)
@@ -1337,45 +1215,87 @@ def extract_scoreboard_from_video_paddle(
         "away_score": away_score_best,
         "home_score": home_score_best,
         "score": legacy_score,
-        "clock": clk,                       # prefers 'gameclock' if valid earlier
+        "clock": clk_best,
         "quarter_text": quarter_text,
         "quarter": quarter,
-        # NEW fields
         "down": down_best,
-        "distance": distance_best,              # None when Goal
-        "distance_text": distance_text_best,    # "10" or "GOAL"
-        "yardline_side": yard_side_best,        # e.g., "BUF"
-        "yardline": yardline_best,              # 0..50
+        "distance": distance_best,
+        "distance_text": distance_text_best,
+        "yardline_side": yard_side_best,
+        "yardline": yardline_best,
         "used_stub": False,
         "_preset": chosen_preset,
+        "_auto_profile": auto_profile,
     }
-    if not any((
-        away_team,
-        home_team,
-        away_score_text,
-        home_score_text,
-        away_score_best is not None,
-        home_score_best is not None,
-        legacy_score,
-        clk,
-        quarter_text,
-        quarter,
-        down_best,
-        distance_best,
-        yardline_best,
-    )):
-        return {"used_stub": True, "_preset": chosen_preset}
 
-    if viz:
-        result["_viz_dir"] = str(run_dir)
+    if not any(
+        (
+            away_team,
+            home_team,
+            away_score_text,
+            home_score_text,
+            away_score_best is not None,
+            home_score_best is not None,
+            legacy_score,
+            clk_best,
+            quarter_text,
+            quarter,
+            down_best,
+            distance_best,
+            yardline_best,
+        )
+    ):
+        return {
+            "used_stub": True,
+            "_preset": chosen_preset,
+            "_auto_profile": auto_profile,
+        }
 
     return result
 
 
 if __name__ == "__main__":
-    import sys, json
-    video = sys.argv[1] if len(sys.argv) > 1 else "Madden Clip.mp4"
-    flags = set(a for a in sys.argv[2:] if a.startswith("--"))
-    viz = ("--viz" in flags)
-    data = extract_scoreboard_from_video_paddle(video, viz=viz)
-    print(json.dumps(data, indent=2))
+    import argparse
+
+    parser = argparse.ArgumentParser(description="EasyOCR-based Madden scoreboard OCR")
+    parser.add_argument(
+        "video", help="Path to the video file (e.g. mr_tai_gameplay/clip.mp4)"
+    )
+    parser.add_argument(
+        "--t",
+        type=float,
+        default=0.10,
+        help="Timestamp (in seconds) for frame capture",
+    )
+    parser.add_argument(
+        "--attempts", type=int, default=1, help="How many frames to sample"
+    )
+    parser.add_argument(
+        "--viz",
+        action="store_true",
+        help="Enable visualization outputs (save crops, ROIs)",
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Skin preset: MNP, TNP, SNP, DEFAULT. If omitted, auto-detect via top-right label.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Print extra debug info"
+    )
+
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    result = extract_scoreboard_from_video_paddle(
+        args.video,
+        t=args.t,
+        attempts=args.attempts,
+        viz=args.viz,
+        profile_key=args.profile,
+    )
+
+    print(json.dumps(result, indent=2))
