@@ -1,7 +1,4 @@
 // frontend/src/lib/api.js
-// Centralized API helpers for Mr. TAI frontend
-
-// Base URL (no trailing slash)
 const RAW_API_BASE = import.meta?.env?.VITE_API_BASE ?? "http://localhost:8000";
 export const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
 
@@ -23,14 +20,7 @@ export async function getHealth() {
   return httpJson(`${API_BASE}/health`);
 }
 
-// ---- Upload (optional legacy helper) ----
-export async function uploadFile(file) {
-  const fd = new FormData();
-  fd.append("file", file);
-  return httpJson(`${API_BASE}/upload`, { method: "POST", body: fd });
-}
-
-// ---- One-shot pipeline (video → OCR → LLM → TTS → mux) ----
+// ---- One-shot pipeline ----
 export async function runCommentaryFromVideo({ file, tone = "neutral", bias = "neutral", gender = "male" }) {
   if (!file) throw new Error("Video file is required");
   const fd = new FormData();
@@ -48,7 +38,7 @@ export async function getVoiceOptions({ tone = "neutral", gender } = {}) {
   if (gender) u.searchParams.set("gender", gender);
   const res = await fetch(u);
   if (!res.ok) throw new Error(`voice-options failed: ${res.status}`);
-  return res.json(); // { voices:[{id,name,gender,emotions,suggested_emotion}], tone, gender }
+  return res.json();
 }
 
 export async function previewVoice({ tone = "neutral", bias = "neutral", gender = "male", text = "Mic check. One-two.", voiceId, emotion } = {}) {
@@ -62,42 +52,11 @@ export async function previewVoice({ tone = "neutral", bias = "neutral", gender 
   return httpJson(`${API_BASE}/pipeline/voice-preview`, { method: "POST", body: fd });
 }
 
-// ---- Legacy: direct analyze endpoint (kept for compatibility) ----
-export async function analyzeCommentate(
-  file,
-  {
-    home_team = null,
-    away_team = null,
-    score = null,
-    quarter = null,
-    clock = null,
-    tone = "play-by-play",
-    bias = "neutral",
-    voice = "default",
-    audio_only = false,
-  } = {}
-) {
-  const fd = new FormData();
-  if (file) fd.append("file", file);
-  if (home_team != null) fd.append("home_team", String(home_team));
-  if (away_team != null) fd.append("away_team", String(away_team));
-  if (score != null) fd.append("score", String(score));
-  if (quarter != null) fd.append("quarter", String(quarter));
-  if (clock != null) fd.append("clock", String(clock));
-  fd.append("tone", tone);
-  fd.append("bias", bias);
-  fd.append("voice", voice);
-  fd.append("audio_only", String(audio_only));
-  return httpJson(`${API_BASE}/analyze_commentate`, { method: "POST", body: fd });
-}
-
 export default {
   API_BASE,
   staticUrl,
   getHealth,
-  uploadFile,
   runCommentaryFromVideo,
   getVoiceOptions,
   previewVoice,
-  analyzeCommentate,
 };
