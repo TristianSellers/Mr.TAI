@@ -35,11 +35,16 @@ export default function Commentator() {
   const [tone, setTone] = useState("hype");
   const [bias, setBias] = useState("neutral");
   const [gender, setGender] = useState("male");
+
   const [voices, setVoices] = useState([]);
   const [loading, setLoading] = useState(false);
   const [resp, setResp] = useState(null);
   const [error, setError] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
+
+  // Progress bar (SYNC-only animation)
+  const [progressActive, setProgressActive] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   const label = { display: "grid", gap: 6, fontSize: 12, color: "#374151", lineHeight: 1.25 };
   const input = { padding: 8, border: "1px solid #d1d5db", borderRadius: 6 };
@@ -54,7 +59,7 @@ export default function Commentator() {
     });
   }, [voices]);
 
-  // refresh voice list when tone changes (API returns suggested_emotion keyed to current tone)
+  // refresh voice list when tone changes
   useEffect(() => {
     (async () => {
       try {
@@ -68,11 +73,34 @@ export default function Commentator() {
 
   async function onAnalyze() {
     if (!file) return setError("Select a video first.");
-    setError(null); setResp(null); setLoading(true);
+
+    setError(null);
+    setResp(null);
+    setLoading(true);
+
+    // Start progress animation
+    setProgressActive(true);
+    setProgress(0);
+
+    const interval = setInterval(() => {
+      setProgress(p => {
+        if (p < 80) return p + 2;
+        return 80;
+      });
+    }, 200);
+
     try {
       const data = await runCommentaryFromVideo({ file, tone, bias, gender });
+
+      clearInterval(interval);
+      setProgress(100);
+      setProgressActive(false);
+
       setResp(data);
     } catch (e) {
+      clearInterval(interval);
+      setProgressActive(false);
+      setProgress(0);
       setError(e?.message || "Request failed");
     } finally {
       setLoading(false);
@@ -80,7 +108,8 @@ export default function Commentator() {
   }
 
   async function onPreviewSpecific(v) {
-    setError(null); setPreviewUrl("");
+    setError(null);
+    setPreviewUrl("");
     try {
       const data = await previewVoice({
         tone, bias, gender,
@@ -101,29 +130,36 @@ export default function Commentator() {
       <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
         <label style={label}>
           <span>Video</span>
-          <input type="file" accept="video/*" onChange={(e)=>setFile(e.target.files?.[0]||null)} disabled={loading}/>
+          <input
+            type="file"
+            accept="video/*"
+            onChange={(e) => setFile(e.target.files?.[0] || null)}
+            disabled={loading}
+          />
         </label>
 
         <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr 1fr" }}>
           <label style={label}>
             <span>Tone</span>
-            <select style={input} value={tone} onChange={(e)=>setTone(e.target.value)} disabled={loading}>
+            <select style={input} value={tone} onChange={(e) => setTone(e.target.value)} disabled={loading}>
               <option value="hype">hype</option>
               <option value="neutral">neutral</option>
               <option value="radio">radio</option>
             </select>
           </label>
+
           <label style={label}>
             <span>Bias</span>
-            <select style={input} value={bias} onChange={(e)=>setBias(e.target.value)} disabled={loading}>
+            <select style={input} value={bias} onChange={(e) => setBias(e.target.value)} disabled={loading}>
               <option value="neutral">neutral</option>
               <option value="home">home</option>
               <option value="away">away</option>
             </select>
           </label>
+
           <label style={label}>
             <span>Gender</span>
-            <select style={input} value={gender} onChange={(e)=>setGender(e.target.value)} disabled={loading}>
+            <select style={input} value={gender} onChange={(e) => setGender(e.target.value)} disabled={loading}>
               <option value="male">male</option>
               <option value="female">female</option>
             </select>
@@ -135,6 +171,7 @@ export default function Commentator() {
           <div style={{ fontSize: 12, color: "#374151" }}>
             Voices (click Preview to audition):
           </div>
+
           <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}>
             {decoratedVoices.map(v => (
               <div key={v.id} style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 10 }}>
@@ -148,6 +185,7 @@ export default function Commentator() {
                 <div style={{ fontSize: 12, color: "#6b7280", marginTop: 2 }}>
                   suggested: {v.suggested_emotion}
                 </div>
+
                 <button style={{ marginTop: 8 }} onClick={() => onPreviewSpecific(v)} disabled={loading}>
                   Preview
                 </button>
@@ -156,14 +194,41 @@ export default function Commentator() {
           </div>
         </div>
 
+        {/* Buttons */}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button onClick={onAnalyze} disabled={loading || !file}>
             {loading ? "Working…" : "Analyze & Commentate"}
           </button>
         </div>
 
+        {/* Progress bar */}
+        {progressActive && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 12, marginBottom: 4 }}>
+              Processing… {progress}%
+            </div>
+
+            <div style={{
+              width: "100%",
+              height: 10,
+              background: "#e5e7eb",
+              borderRadius: 4,
+            }}>
+              <div style={{
+                width: `${progress}%`,
+                height: "100%",
+                background: "#3b82f6",
+                borderRadius: 4,
+                transition: "width 0.25s ease",
+              }} />
+            </div>
+          </div>
+        )}
+
+        {/* Errors */}
         {error && <div style={{ color: "crimson" }}>{error}</div>}
 
+        {/* Voice preview */}
         {previewUrl && (
           <div>
             <h3>Voice Preview</h3>
@@ -171,14 +236,49 @@ export default function Commentator() {
           </div>
         )}
 
+        {/* Final output */}
         {resp && (
           <div style={{ marginTop: 16, display: "grid", gap: 12 }}>
             <div>
               <h3>Commentary Text</h3>
               <p style={{ whiteSpace: "pre-wrap" }}>{resp.text}</p>
             </div>
-            {resp.audio_url && (<div><h3>Audio</h3><audio controls src={staticUrl(resp.audio_url)} /></div>)}
-            {resp.video_url && (<div><h3>Dubbed Video</h3><video controls src={staticUrl(resp.video_url)} style={{ width: "100%", borderRadius: 8 }} /></div>)}
+
+            {resp.audio_url && (
+              <div>
+                <h3>Audio</h3>
+                <audio controls src={staticUrl(resp.audio_url)} />
+              </div>
+            )}
+
+            {resp.video_url && (
+              <div>
+                <h3>Dubbed Video</h3>
+                <video controls src={staticUrl(resp.video_url)} style={{ width: "100%", borderRadius: 8 }} />
+              </div>
+            )}
+
+            {/* Download button */}
+            {resp.video_url && (
+              <div>
+                <h3>Download Video</h3>
+                <a
+                  href={staticUrl(resp.video_url)}
+                  download
+                  style={{
+                    display: "inline-block",
+                    padding: "8px 12px",
+                    background: "#10b981",
+                    color: "white",
+                    borderRadius: 6,
+                    textDecoration: "none",
+                  }}
+                >
+                  ⬇ Download Dubbed Video
+                </a>
+              </div>
+            )}
+
             <small>
               {resp.meta?.prompt_tone ? `tone: ${resp.meta.prompt_tone}` : ""}
               {resp.meta?.prompt_bias ? ` • bias: ${resp.meta.prompt_bias}` : ""}
